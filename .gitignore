@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+.env
+.venv/
+*.egg-info/
+
+# Node/Next.js
+node_modules/
+.next/
+.next-dev.log
+.next-dev-live.log
+
+# VSCode / IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Local data
+storage/
+backend.log
+uvicorn.log
+backend/models/
+
+# Databases
+backend/tryon.db
+tryon.db
