@@ -58,3 +58,26 @@ export async function createVideoClip(form: FormData): Promise<VideoClipResponse
   console.log("[API] Received video clip response:", data);
   return data;
 }
+
+export type VideoJob = {
+  job_id: string;
+  status: "pending" | "processing" | "completed" | "failed";
+  frames_done: number;
+  frames_total: number;
+  result_video_path?: string | null;
+  failure_reason?: string | null;
+  created_at: number;
+};
+
+export async function createVideoFaceSwap(form: FormData): Promise<VideoJob> {
+  console.log("[API] Sending POST request to", `${API_BASE}/video/faceswap`);
+  const { data } = await axios.post<VideoJob>(`${API_BASE}/video/faceswap`, form, {
+    headers: { "Content-Type": "multipart/form-data" }
+  });
+  return data;
+}
+
+export async function getVideoFaceSwapJob(jobId: string): Promise<VideoJob> {
+  const { data } = await axios.get<VideoJob>(`${API_BASE}/video/faceswap/${jobId}`);
+  return data;
+}

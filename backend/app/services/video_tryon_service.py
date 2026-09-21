@@ -1,15 +1,18 @@
-"""Video try-on engine.
+"""Video try-on / video face-swap engine.
 
 Applies the existing image try-on pipeline (see `pipelines/tryon_pipeline.py`)
 to every frame of a source video, then reassembles the processed frames back
-into a video and restores the original audio track.
+into a video and restores the original audio track. Used for both garment
+try-on video (garment stays fixed, each frame is the person) and face-swap
+video (source face stays fixed, each frame is the target to re-face).
 
 The frame-extract -> per-frame-process -> merge -> restore-audio shape is a
 standard video pipeline pattern (also used by tools like FaceFusion for
 face-swap video), but this implementation is written from scratch against
-ffmpeg/ffprobe directly and only carries the garment try-on logic that
-already lives in this project. It intentionally does not include any of
-FaceFusion's own code, models, or content-moderation/guardrail modules.
+ffmpeg/ffprobe directly and only carries this project's own garment-swap and
+face-swap logic (`pipelines/tryon_pipeline.py`, `segmentation_service.py`).
+It intentionally does not include any of FaceFusion's own code, models, or
+content-moderation/guardrail modules.
 """
 
 from __future__ import annotations
@@ -182,9 +185,19 @@ class VideoTryOnEngine:
         fps: Optional[float] = None,
         max_frames: Optional[int] = None,
         frame_stride: int = 1,
+        frame_slot: str = "user_image",
         progress_cb: Optional[ProgressCallback] = None,
     ) -> Path:
         """Process `video_path` frame-by-frame and write the result to `output_path`.
+
+        `garment_path` is the fixed reference image reused for every frame (the
+        garment photo for garment_swap, or the single source-face photo for
+        face_swap). `frame_slot` picks which of TryOnPipeline.apply's two image
+        arguments the per-frame video content fills:
+        - "user_image" (default, used by garment_swap): each frame is the person/
+          body being dressed, `garment_path` is the garment.
+        - "garment_image" (used by face_swap): each frame is the target whose
+          face gets replaced, `garment_path` is the fixed source-face image.
 
         frame_stride > 1 processes every Nth frame through the (expensive) try-on
         pipeline and reuses the previous processed frame for the skipped ones,
@@ -209,9 +222,13 @@ class VideoTryOnEngine:
                 out_frame_path = frames_out_dir / frame_path.name
 
                 if index % frame_stride == 0 or last_output_frame is None:
+                    if frame_slot == "garment_image":
+                        user_image_path, garment_image_path = garment_path, frame_path
+                    else:
+                        user_image_path, garment_image_path = frame_path, garment_path
                     self.pipeline.apply(
-                        frame_path,
-                        garment_path,
+                        user_image_path,
+                        garment_image_path,
                         out_frame_path,
                         prompt=prompt,
                         mode=mode,

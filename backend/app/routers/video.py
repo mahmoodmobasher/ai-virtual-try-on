@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-import shutil
 import time
 from pathlib import Path
 from typing import Literal
@@ -208,4 +206,116 @@ async def get_video_tryon_job(job_id: str) -> VideoTryOnJob:
     job = _video_tryon_jobs.get(job_id)
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video try-on job not found")
+    return job
+
+
+# ----------------------------------------------------------------------
+# Video face swap: a separate feature/section from garment video try-on
+# above. Swaps one fixed source-face photo onto every frame of a target
+# video (the FaceFusion-style video face-swap workflow), using only this
+# project's own local face-swap logic (segmentation_service.py, InsightFace).
+# ----------------------------------------------------------------------
+
+_video_faceswap_jobs: dict[str, VideoTryOnJob] = {}
+
+
+def _run_video_faceswap_job(
+    job_id: str,
+    target_video_path: Path,
+    source_face_path: Path,
+    *,
+    fps: float | None,
+    max_frames: int | None,
+    frame_stride: int,
+) -> None:
+    job = _video_faceswap_jobs[job_id]
+    job.status = "processing"
+
+    def on_progress(done: int, total: int) -> None:
+        job.frames_done = done
+        job.frames_total = total
+
+    output_path = settings.video_results_dir / f"faceswap-{job_id}.mp4"
+    engine = get_video_tryon_engine()
+
+    try:
+        engine.run(
+            target_video_path,
+            source_face_path,
+            output_path,
+            mode="face_swap",
+            frame_slot="garment_image",  # each video frame is the target; the fixed image is the source face
+            fps=fps,
+            max_frames=max_frames,
+            frame_stride=frame_stride,
+            progress_cb=on_progress,
+        )
+        job.result_video_path = f"/video-results/{output_path.name}"
+        job.status = "completed"
+    except Exception as exc:  # pragma: no cover - background task error path
+        logger.exception("Video face swap job %s failed: %s", job_id, exc)
+        job.status = "failed"
+        job.failure_reason = str(exc)
+    finally:
+        for path in (target_video_path, source_face_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+@router.post("/faceswap", response_model=VideoTryOnJob, status_code=status.HTTP_202_ACCEPTED)
+async def create_video_faceswap_job(
+    background_tasks: BackgroundTasks,
+    target_video: UploadFile = File(...),
+    source_face_image: UploadFile = File(...),
+    fps: float | None = Form(default=None),
+    max_frames: int | None = Form(default=None),
+    frame_stride: int = Form(default=1),
+) -> VideoTryOnJob:
+    """Swap `source_face_image` onto every frame of `target_video`, preserving its
+    body, pose and audio (mirrors FaceFusion's video face-swap workflow, using
+    only this project's own local face-swap pipeline)."""
+    if not target_video.content_type or not target_video.content_type.startswith("video/"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please upload a video file.")
+    if not source_face_image.content_type or not source_face_image.content_type.startswith("image/"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please upload a JPEG or PNG image.")
+
+    temp_dir = settings.storage_dir / "tmp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    job_id = uuid4().hex
+    video_suffix = Path(target_video.filename or "input.mp4").suffix or ".mp4"
+    face_suffix = Path(source_face_image.filename or "face.png").suffix or ".png"
+    video_path = temp_dir / f"video-faceswap-target-{job_id}{video_suffix}"
+    face_path = temp_dir / f"video-faceswap-source-{job_id}{face_suffix}"
+
+    try:
+        video_path.write_bytes(await target_video.read())
+        face_path.write_bytes(await source_face_image.read())
+    finally:
+        await target_video.close()
+        await source_face_image.close()
+
+    job = VideoTryOnJob(job_id=job_id, status="pending", created_at=time.time())
+    _video_faceswap_jobs[job_id] = job
+
+    background_tasks.add_task(
+        _run_video_faceswap_job,
+        job_id,
+        video_path,
+        face_path,
+        fps=fps,
+        max_frames=max_frames,
+        frame_stride=frame_stride,
+    )
+
+    return job
+
+
+@router.get("/faceswap/{job_id}", response_model=VideoTryOnJob)
+async def get_video_faceswap_job(job_id: str) -> VideoTryOnJob:
+    job = _video_faceswap_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video face swap job not found")
     return job

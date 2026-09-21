@@ -9,7 +9,8 @@ const links = [
   { href: "#planner", label: "Moodboard" },
   { href: "#analytics", label: "Insights" },
   { href: "#pricing", label: "Pricing" },
-  { href: "/video-lab", label: "Video Lab" }
+  { href: "/video-lab", label: "Video Lab" },
+  { href: "/face-swap-video", label: "Face Swap Video" }
 ];
 
 export function Navigation() {
