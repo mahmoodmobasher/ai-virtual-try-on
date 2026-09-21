@@ -14,6 +14,8 @@ from ..body_segmentation_service import get_body_segmentation_service
 from ..detectron2_service import get_detectron2_service
 from ..ollama_client import get_ollama_client
 from ..lm_studio_client import get_lm_studio_client
+from ..catvton import get_local_tryon_engine
+from ..fashn_client import get_fashn_client
 
 try:
     import torch
@@ -37,7 +39,7 @@ from ...core.config import get_settings
 
 
 class TryOnPipeline:
-    """Pipeline orchestrator for face swap and CatVTON-FLUX try-on modes."""
+    """Pipeline orchestrator for clothes swap, face swap and CatVTON-FLUX try-on modes."""
 
     def __init__(self, cache_dir: Optional[Path] = None) -> None:
         self.settings = get_settings()
@@ -51,12 +53,18 @@ class TryOnPipeline:
             else "cpu"
         )
 
-        self.segmentation = get_segmentation_service()
+        self._segmentation = None
         self._body_segmentation = None
         self._detectron2 = None
         self._llm = None
         self._catvton_pipe = None
         self._catvton_dtype = None
+
+    @property
+    def segmentation(self):
+        if self._segmentation is None:
+            self._segmentation = get_segmentation_service()
+        return self._segmentation
 
     @property
     def body_segmentation(self):
@@ -90,7 +98,8 @@ class TryOnPipeline:
         output_path: Path,
         *,
         prompt: str | None = None,
-        mode: str = "face_swap",
+        mode: str = "garment_swap",
+        category: str = "auto",
     ) -> Path:
         """
         Generate try-on result with preprocessing.
@@ -99,12 +108,28 @@ class TryOnPipeline:
             user_image_path: Path to user's model photo.
             garment_image_path: Path to garment/reference photo.
             output_path: Where to save the result.
-            prompt: Optional text prompt for CatVTON-FLUX.
-            mode: "face_swap" or "catvton_flux" (legacy "viton_hd" accepted).
+            prompt: Optional text prompt for CatVTON-FLUX / FASHN Try-On Max.
+            mode: "garment_swap", "face_swap" or "catvton_flux" (legacy "viton_hd" accepted).
+            category: Garment category for clothes swap: auto, tops, bottoms or one-pieces.
         """
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        logger.info("Try-on mode: %s", mode)
+        logger.info("Try-on mode: {}", mode)
+
+        if mode == "garment_swap":
+            if self.settings.garment_swap_engine == "fashn":
+                if self.settings.enforce_local_only:
+                    raise RuntimeError(
+                        "garment_swap_engine='fashn' would upload images to the hosted FASHN API, "
+                        "but enforce_local_only=True blocks that. Set TRYON_GARMENT_SWAP_ENGINE=local "
+                        "or explicitly set TRYON_ENFORCE_LOCAL_ONLY=false to allow it."
+                    )
+                return get_fashn_client().try_on(
+                    user_image_path, garment_image_path, output_path, category=category, prompt=prompt
+                )
+            return get_local_tryon_engine().try_on(
+                user_image_path, garment_image_path, output_path, category=category
+            )
 
         if mode in {"catvton_flux", "viton_hd"}:
             logger.info("Using CatVTON-FLUX mode for garment transfer")
@@ -153,7 +178,7 @@ class TryOnPipeline:
                 "xiaozaa/catvton-flux-beta",
                 torch_dtype=dtype,
                 cache_dir=self.cache_dir,
-                local_files_only=False,
+                local_files_only=True,
             )
 
             base_model = "black-forest-labs/FLUX.1-Fill-dev"
@@ -163,7 +188,7 @@ class TryOnPipeline:
                 transformer=transformer,
                 torch_dtype=dtype,
                 cache_dir=self.cache_dir,
-                local_files_only=False,
+                local_files_only=True,
             )
 
             if self.device == "cuda":
@@ -191,79 +216,52 @@ class TryOnPipeline:
         garment_image_path: Path,
         output_path: Path,
     ) -> Path:
-        preprocess_dir = self.cache_dir / "preprocessed"
-        preprocess_dir.mkdir(parents=True, exist_ok=True)
-
         try:
-            logger.info("Preprocessing portrait with InsightFace + rembg...")
-            preprocessed = self.segmentation.preprocess_portrait(
-                user_image_path,
-                preprocess_dir,
-                align_face=False,
-                remove_bg=True,
-            )
-            processed_user_path = (
-                Path(preprocessed["segmented_path"]) if preprocessed.get("segmented_path") else user_image_path
-            )
-        except Exception as exc:  # pragma: no cover
-            logger.warning("Preprocessing failed, using original image: %s", exc)
-            processed_user_path = user_image_path
+            segmentation = self.segmentation
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Face swap is unavailable because its ML runtime or model files are missing."
+            ) from exc
 
-        user_img_bgr = cv2.imread(str(processed_user_path))
+        user_img_bgr = cv2.imread(str(user_image_path))
         garment_img_bgr = cv2.imread(str(garment_image_path))
 
-        logger.info("Step 1: Segmenting body regions with Detectron2...")
-        try:
-            user_segmented, user_mask = self.detectron2.segment_person(user_img_bgr, threshold=0.5)
-            garment_segmented, garment_mask = self.detectron2.segment_person(garment_img_bgr, threshold=0.5)
-            debug_dir = self.cache_dir / "debug"
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(debug_dir / "user_segmented_detectron2.png"), user_segmented)
-            cv2.imwrite(str(debug_dir / "user_mask.png"), user_mask)
-            cv2.imwrite(str(debug_dir / "garment_segmented_detectron2.png"), garment_segmented)
-            cv2.imwrite(str(debug_dir / "garment_mask.png"), garment_mask)
-        except Exception as exc:  # pragma: no cover
-            logger.warning("Detectron2 segmentation failed, falling back to Mediapipe: %s", exc)
-            try:
-                user_segmented, user_mask = self.body_segmentation.segment_person(user_img_bgr, threshold=0.5)
-                garment_segmented, garment_mask = self.body_segmentation.segment_person(garment_img_bgr, threshold=0.5)
-            except Exception as fallback_exc:  # pragma: no cover
-                logger.warning("Mediapipe segmentation also failed: %s", fallback_exc)
+        if user_img_bgr is None:
+            raise ValueError("The source-face image could not be read. Please upload a valid JPEG or PNG image.")
+        if garment_img_bgr is None:
+            raise ValueError("The reference-outfit image could not be read. Please upload a valid JPEG or PNG image.")
 
-        user_faces = self.segmentation.face_app.get(user_img_bgr)
-        garment_faces = self.segmentation.face_app.get(garment_img_bgr)
+        user_faces = segmentation.face_app.get(user_img_bgr)
+        garment_faces = segmentation.face_app.get(garment_img_bgr)
         has_user_face = len(user_faces) > 0
         has_garment_face = len(garment_faces) > 0
-        logger.info("Face detection: User has face=%s, Garment has face=%s", has_user_face, has_garment_face)
+        logger.info("Face detection: source={}, reference={}", has_user_face, has_garment_face)
 
         if has_user_face and has_garment_face:
             try:
-                swapped = self.segmentation.swap_face(
+                swapped = segmentation.swap_face(
                     source_image=user_img_bgr,
                     target_image=garment_img_bgr,
                 )
                 cv2.imwrite(str(output_path), swapped)
-                logger.info("Face swap complete, saved to %s", output_path)
+                logger.info("Face swap complete, saved to {}", output_path)
                 return output_path
             except Exception as exc:  # pragma: no cover
                 logger.exception("Face swap failed: %s", exc)
         else:
+            missing = []
+            if not has_user_face:
+                missing.append("source image")
+            if not has_garment_face:
+                missing.append("reference outfit image")
             error_msg = (
-                "⚠️ Face swap requires BOTH images to have faces. "
-                f"User has face: {has_user_face}, Garment has face: {has_garment_face}. "
-                "Please upload a reference photo showing someone wearing the garment (not just the garment alone)."
+                f"No clear face was detected in the {' and '.join(missing)}. "
+                "Use clear, front-facing photos; the reference image must show a person wearing the outfit."
             )
             logger.warning(error_msg)
-            result = garment_img_bgr.copy()
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            text = "Garment needs face for swap"
-            cv2.putText(result, text, (50, 50), font, 1, (0, 0, 255), 2, cv2.LINE_AA)
-            cv2.imwrite(str(output_path), result)
             raise ValueError(error_msg)
 
-        logger.warning("Face swap pipeline unavailable; using fallback overlay result.")
-        self._fallback_overlay(processed_user_path, garment_image_path, output_path)
-        return output_path
+        raise RuntimeError("Face swap failed to produce an output image.")
 
     # ------------------------------------------------------------------
     # CatVTON mode

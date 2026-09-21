@@ -3,18 +3,26 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-from detectron2 import model_zoo
-from detectron2.config import get_cfg
-from detectron2.engine import DefaultPredictor
 from loguru import logger
 from pathlib import Path
 from typing import Optional
+
+try:
+    from detectron2 import model_zoo
+    from detectron2.config import get_cfg
+    from detectron2.engine import DefaultPredictor
+except ImportError:  # Optional ML dependency
+    model_zoo = None
+    get_cfg = None
+    DefaultPredictor = None
 
 
 class Detectron2SegmentationService:
     """Body/person segmentation using Detectron2."""
 
     def __init__(self, model_name: str = "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml") -> None:
+        if model_zoo is None or get_cfg is None or DefaultPredictor is None:
+            raise RuntimeError("Detectron2 is not installed; another segmentation fallback will be used.")
         logger.info("Initializing Detectron2 for person segmentation...")
         
         # Configure Detectron2
@@ -198,4 +206,3 @@ def get_detectron2_service() -> Detectron2SegmentationService:
     if _detectron2_service is None:
         _detectron2_service = Detectron2SegmentationService()
     return _detectron2_service
-

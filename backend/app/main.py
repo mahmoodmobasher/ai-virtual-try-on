@@ -65,6 +65,11 @@ def create_app() -> FastAPI:
         StaticFiles(directory=settings.catalog_dir),
         name="catalog",
     )
+    app.mount(
+        "/video-results",
+        StaticFiles(directory=settings.video_results_dir),
+        name="video-results",
+    )
 
     return app
 

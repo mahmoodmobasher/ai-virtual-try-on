@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -31,7 +32,8 @@ class TryOnService:
         filename: str | None,
         user_reference: Optional[str] = None,
         prompt: Optional[str] = None,
-        mode: str = "face_swap",
+        mode: str = "garment_swap",
+        category: str = "auto",
     ) -> TryOnJob:
         if garment is None and garment_image_bytes is None:
             raise ValueError("Either a garment from the catalog or a garment image upload must be provided.")
@@ -54,6 +56,7 @@ class TryOnService:
         if garment_path:
             meta["garment_image_path"] = str(garment_path)
         meta["mode"] = mode  # Store the try-on mode
+        meta["category"] = category
 
         job = TryOnJob(
             garment_id=garment.id if garment else None,
@@ -90,19 +93,20 @@ class TryOnService:
                 raise FileNotFoundError("Garment image not available for try-on job.")
 
             output_path = Path(self.settings.results_dir) / f"{job.id}_result.png"
-            tryon_mode = job.meta.get("mode", "face_swap") if job.meta else "face_swap"
-            
-            self.pipeline.apply(
+            meta = job.meta or {}
+
+            # Run in a worker thread so slow inference/API calls don't block the event loop.
+            await asyncio.to_thread(
+                self.pipeline.apply,
                 Path(job.input_image_path),
                 resolved_garment_path,
                 output_path,
-                prompt=job.meta.get("prompt") if job.meta else None,
-                mode=tryon_mode,
+                prompt=meta.get("prompt"),
+                mode=meta.get("mode", "garment_swap"),
+                category=meta.get("category", "auto"),
             )
             job.result_image_path = f"/results/{output_path.name}"
-            meta = job.meta or {}
-            meta["output_path"] = str(output_path)
-            job.meta = meta
+            job.meta = {**meta, "output_path": str(output_path)}
             job.status = TryOnStatus.completed
         except Exception as exc:
             logger.exception("Failed to process job %s: %s", job.id, exc)

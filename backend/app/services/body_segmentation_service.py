@@ -2,18 +2,27 @@
 from __future__ import annotations
 
 import cv2
-import mediapipe as mp
 import numpy as np
 from loguru import logger
 from pathlib import Path
 from PIL import Image
 from typing import Optional
 
+try:
+    import mediapipe as mp
+except ImportError:  # Optional ML dependency
+    mp = None
+
 
 class BodySegmentationService:
     """Body segmentation using Mediapipe for virtual try-on."""
 
     def __init__(self) -> None:
+        if mp is None:
+            raise RuntimeError(
+                "Body segmentation requires the optional ML dependencies. "
+                "Install them with `make setup-ml` using Python 3.11."
+            )
         logger.info("Initializing Mediapipe Selfie Segmentation...")
         self.mp_selfie_segmentation = mp.solutions.selfie_segmentation
         # Model selection: 0 for general, 1 for landscape (higher accuracy)
@@ -171,4 +180,3 @@ def get_body_segmentation_service() -> BodySegmentationService:
     if _body_segmentation_service is None:
         _body_segmentation_service = BodySegmentationService()
     return _body_segmentation_service
-

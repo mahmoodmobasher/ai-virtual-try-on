@@ -3,19 +3,33 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-from insightface.app import FaceAnalysis
-from insightface.model_zoo import get_model
 from loguru import logger
 from pathlib import Path
 from PIL import Image
-from rembg import remove
 from typing import Optional
+
+try:
+    from insightface.app import FaceAnalysis
+    from insightface.model_zoo import get_model
+except ImportError:  # Optional ML dependency
+    FaceAnalysis = None
+    get_model = None
+
+try:
+    from rembg import remove
+except ImportError:  # Optional ML dependency
+    remove = None
 
 
 class SegmentationService:
     """Combines InsightFace face detection/swapping with rembg background removal."""
 
     def __init__(self) -> None:
+        if FaceAnalysis is None or get_model is None or remove is None:
+            raise RuntimeError(
+                "Face analysis requires the optional ML dependencies. "
+                "Install them with `make setup-ml` using Python 3.11."
+            )
         logger.info("Initializing InsightFace face analysis...")
         self.face_app = FaceAnalysis(providers=["CPUExecutionProvider"])
         self.face_app.prepare(ctx_id=0, det_size=(640, 640))
@@ -188,4 +202,3 @@ def get_segmentation_service() -> SegmentationService:
     if _segmentation_service is None:
         _segmentation_service = SegmentationService()
     return _segmentation_service
-

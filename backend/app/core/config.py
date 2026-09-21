@@ -35,6 +35,26 @@ class Settings(BaseSettings):
     # Segmentation service preference
     use_detectron2: bool = True  # Use Detectron2 for body segmentation (fallback to Mediapipe if fails)
 
+    # Clothes swap engine: "local" runs CatVTON on this machine, "fashn" uses the hosted FASHN API
+    garment_swap_engine: Literal["local", "fashn"] = "local"
+
+    # When true (default), refuse to use any hosted/remote inference engine (e.g. the
+    # FASHN API) even if garment_swap_engine is misconfigured to "fashn" — user images
+    # must never leave this machine. Set to false only if you deliberately want the
+    # hosted API and accept that images will be uploaded to a third party.
+    enforce_local_only: bool = True
+    local_tryon_width: int = 768
+    local_tryon_height: int = 1024
+    local_tryon_steps: int = 30
+    local_tryon_guidance_scale: float = 2.5
+
+    # FASHN hosted try-on API (clothes swap)
+    fashn_api_key: Optional[str] = None
+    fashn_api_base: str = "https://api.fashn.ai/v1"
+    fashn_model: str = "tryon-v1.6"  # or "tryon-max"
+    fashn_mode: str = "quality"  # tryon-v1.6: performance|balanced|quality; tryon-max: fast|balanced|quality
+    fashn_timeout_seconds: int = 180
+
     # CatVTON-FLUX configuration
     catvton_width: int = 576
     catvton_height: int = 768
