@@ -8,6 +8,38 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { BACKEND_BASE, createTryOn, getTryOnJob, TryOnJob } from "@/lib/api";
 
+type TryOnMode = "garment_swap" | "face_swap";
+type GarmentCategory = "auto" | "tops" | "bottoms" | "one-pieces";
+
+const MODE_COPY: Record<
+  TryOnMode,
+  { label: string; description: string; personLabel: string; garmentLabel: string; note: string; missing: string }
+> = {
+  garment_swap: {
+    label: "Clothes swap",
+    description: "The garment is dressed onto your photo while your face, body and pose stay the same.",
+    personLabel: "Upload your photo",
+    garmentLabel: "Upload garment photo",
+    note: "Use a clear, well-lit photo of yourself (half or full body). The garment can be a flat-lay, product shot or worn by another model.",
+    missing: "Upload a photo of yourself and a photo of the garment."
+  },
+  face_swap: {
+    label: "Face swap",
+    description: "Your face is placed on the reference model while their outfit and pose are preserved.",
+    personLabel: "Upload source face",
+    garmentLabel: "Upload reference model wearing outfit",
+    note: "Use two clear, front-facing photos. The result keeps the reference model's outfit and body while replacing their face with the source face.",
+    missing: "Upload a source face photo and a reference photo of someone wearing the outfit."
+  }
+};
+
+const CATEGORIES: { value: GarmentCategory; label: string }[] = [
+  { value: "auto", label: "Auto" },
+  { value: "tops", label: "Top" },
+  { value: "bottoms", label: "Bottom" },
+  { value: "one-pieces", label: "Full outfit" }
+];
+
 type TryOnState = {
   job?: TryOnJob;
   status: "idle" | "uploading" | "processing" | "done" | "error";
@@ -20,8 +52,10 @@ export function TryOnStudio() {
   const [portraitPreview, setPortraitPreview] = useState<string | null>(null);
   const [modelName, setModelName] = useState<string | null>(null);
   const [state, setState] = useState<TryOnState>({ status: "idle" });
+  const [tryOnMode, setTryOnMode] = useState<TryOnMode>("garment_swap");
+  const [category, setCategory] = useState<GarmentCategory>("auto");
+  const copy = MODE_COPY[tryOnMode];
   const [activeCollection, setActiveCollection] = useState("My gallery (all)");
-  const [activeMode, setActiveMode] = useState("Try on clothes with face swap");
   const [activeEngine, setActiveEngine] = useState<"AI Engine 1" | "AI Engine 2">("AI Engine 1");
   const [swapSource, setSwapSource] = useState<"Text" | "Photo">("Photo");
   const [galleryTab, setGalleryTab] = useState<"My gallery" | "Upload" | "Info">("My gallery");
@@ -52,19 +86,17 @@ export function TryOnStudio() {
       console.log("[mutation] Starting try-on generation...");
       console.log("[mutation] userImage:", userImage?.name, "garmentFile:", garmentFile?.name);
       if (!garmentFile || !userImage) {
-        throw new Error("Please select a garment and upload a photo.");
+        throw new Error(copy.missing);
       }
       const formData = new FormData();
       console.log("[mutation] Appending garment_image:", garmentFile.name);
       formData.append("garment_image", garmentFile);
       formData.append("user_image", userImage);
-      formData.append("prompt", "Fashion campaign imagery for uploaded garment.");
-      
-      // Determine mode based on selection
-      const mode =
-        activeMode === "Try on clothes with face swap" ? "face_swap" : "catvton_flux";
-      formData.append("mode", mode);
-      console.log("[mutation] Try-on mode:", mode);
+      formData.append("mode", tryOnMode);
+      if (tryOnMode === "garment_swap") {
+        formData.append("category", category);
+      }
+      console.log("[mutation] Try-on mode:", tryOnMode, "category:", category);
       console.log("[mutation] Calling createTryOn API...");
       return createTryOn(formData);
     },
@@ -178,11 +210,6 @@ export function TryOnStudio() {
   };
 
 
-  const modes = [
-    "Try on clothes with face swap",
-    "Try on clothes without face swap"
-  ];
-
   const collections = ["My gallery (all)", "Campaign launch", "Holiday assets"];
 
   const garmentImageUrl = garmentPreview;
@@ -218,25 +245,45 @@ export function TryOnStudio() {
             </div>
           </div>
 
-          <div className="rounded-3xl border border-white/10 bg-white/5 p-5">
-            <div className="flex items-center justify-between">
-              <p className="text-xs uppercase tracking-[0.3em] text-white/50">Mode</p>
-              <span className="rounded-full bg-white/10 px-3 py-1 text-xs text-white/60">AI Virtual try on clothes</span>
-            </div>
-            <div className="mt-4 flex flex-col gap-2">
-              {modes.map((mode) => (
+          <div className="rounded-3xl border border-brand-500/40 bg-brand-500/10 p-5">
+            <p className="text-xs uppercase tracking-[0.3em] text-white/50">Mode</p>
+            <div className="mt-3 flex gap-2 rounded-full bg-black/30 p-1">
+              {(Object.keys(MODE_COPY) as TryOnMode[]).map((mode) => (
                 <button
                   key={mode}
-                  onClick={() => setActiveMode(mode)}
+                  onClick={() => {
+                    setTryOnMode(mode);
+                    setState({ status: "idle" });
+                  }}
                   className={clsx(
-                    "rounded-2xl border border-white/10 px-4 py-3 text-left text-sm text-white/70 transition hover:border-white/40",
-                    activeMode === mode && "border-brand-500 bg-brand-500/10 text-white"
+                    "w-1/2 rounded-full px-4 py-2 text-sm transition",
+                    tryOnMode === mode ? "bg-white text-black shadow-neon" : "text-white/70"
                   )}
                 >
-                  {mode}
+                  {MODE_COPY[mode].label}
                 </button>
               ))}
             </div>
+            <p className="mt-3 text-xs text-white/60">{copy.description}</p>
+            {tryOnMode === "garment_swap" ? (
+              <div className="mt-4">
+                <p className="text-xs uppercase tracking-[0.3em] text-white/50">Garment type</p>
+                <div className="mt-2 grid grid-cols-4 gap-1 rounded-2xl bg-black/30 p-1">
+                  {CATEGORIES.map((option) => (
+                    <button
+                      key={option.value}
+                      onClick={() => setCategory(option.value)}
+                      className={clsx(
+                        "rounded-xl px-2 py-2 text-xs transition",
+                        category === option.value ? "bg-white text-black" : "text-white/70"
+                      )}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
           </div>
 
           <div className="space-y-4 rounded-3xl border border-white/10 bg-white/5 p-5">
@@ -261,7 +308,9 @@ export function TryOnStudio() {
             </div>
 
             <div className="space-y-2 rounded-2xl border border-dashed border-white/10 bg-black/30 p-4">
-              <p className="text-xs uppercase tracking-[0.3em] text-white/40">Upload human model</p>
+              <p className="text-xs uppercase tracking-[0.3em] text-white/40">
+                {copy.personLabel}
+              </p>
               <div className="relative flex h-80 w-full overflow-hidden rounded-3xl bg-[#0c0c18]">
                 {portraitPreview ? (
                   <>
@@ -301,7 +350,9 @@ export function TryOnStudio() {
                     htmlFor={uploadInputId}
                     className="flex h-full w-full cursor-pointer items-center justify-center border border-dashed border-white/20 rounded-3xl text-white/60 transition hover:border-white/40 hover:bg-white/5"
                   >
-                    <span className="text-sm uppercase tracking-[0.3em]">Upload human model</span>
+                    <span className="text-sm uppercase tracking-[0.3em]">
+                      {copy.personLabel}
+                    </span>
                   </label>
                 )}
               </div>
@@ -339,7 +390,9 @@ export function TryOnStudio() {
             </div>
 
             <div className="space-y-2 rounded-2xl border border-dashed border-white/10 bg-black/30 p-4">
-              <p className="text-xs uppercase tracking-[0.3em] text-white/40">Upload item to wear</p>
+              <p className="text-xs uppercase tracking-[0.3em] text-white/40">
+                {copy.garmentLabel}
+              </p>
               <div className="relative flex h-80 w-full overflow-hidden rounded-3xl bg-[#0c0c18]">
                 {garmentImageUrl ? (
                   <>
@@ -373,7 +426,9 @@ export function TryOnStudio() {
                     htmlFor={garmentInputId}
                     className="flex h-full w-full cursor-pointer items-center justify-center border border-dashed border-white/20 rounded-3xl text-white/60 transition hover:border-white/40 hover:bg-white/5"
                   >
-                    <span className="text-sm uppercase tracking-[0.3em]">Upload item to wear</span>
+                    <span className="text-center text-sm uppercase tracking-[0.3em]">
+                      {copy.garmentLabel}
+                    </span>
                   </label>
                 )}
               </div>
@@ -398,7 +453,7 @@ export function TryOnStudio() {
             <div className="rounded-2xl bg-lime-200/20 p-4 text-xs text-lime-200">
               <p className="font-medium text-lime-100">Note</p>
               <p className="mt-1 text-lime-100/80">
-                Depending on your image, Engine 1 and 2 give slightly different results. Try whichever one works best for your model.
+                {copy.note}
               </p>
             </div>
 
@@ -406,13 +461,13 @@ export function TryOnStudio() {
               onClick={() => {
                 console.log("[Button] Generate Try-On clicked!");
                 console.log("[Button] userImage:", userImage?.name, "garmentFile:", garmentFile?.name);
-                console.log("[Button] Button disabled?", mutation.isLoading || !userImage || !garmentFile);
+                console.log("[Button] Button disabled?", mutation.isPending || !userImage || !garmentFile);
                 mutation.mutate();
               }}
-              disabled={mutation.isLoading || !userImage || !garmentFile}
+              disabled={mutation.isPending || !userImage || !garmentFile}
               className="w-full rounded-full bg-brand-500 py-3 text-sm font-semibold text-white shadow-neon transition hover:scale-[1.01] disabled:cursor-not-allowed disabled:bg-brand-500/40"
             >
-              {mutation.isLoading ? "Generating…" : "Generate Try-On"}
+              {mutation.isPending ? "Generating…" : "Generate Try-On"}
             </button>
           </div>
         </aside>
@@ -491,4 +546,3 @@ export function TryOnStudio() {
     </section>
   );
 }
-

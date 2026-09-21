@@ -63,7 +63,7 @@ export function MoodboardPlanner() {
             </div>
             <button
               onClick={() => mutation.mutate()}
-              disabled={mutation.isLoading}
+              disabled={mutation.isPending}
               className="inline-flex items-center gap-2 rounded-full bg-white px-5 py-2 text-sm font-semibold text-black transition hover:scale-[1.02] disabled:bg-white/40"
             >
               <Sparkles className="h-4 w-4" />
@@ -75,7 +75,7 @@ export function MoodboardPlanner() {
           <label className="text-xs uppercase tracking-[0.3em] text-white/40">AI Treatment</label>
           <div className="mt-3 min-h-[220px] rounded-2xl border border-white/10 bg-black/60 p-5">
             <AnimatePresence mode="wait">
-              {mutation.isLoading ? (
+              {mutation.isPending ? (
                 <motion.p key="loading" initial={{ opacity: 0.4 }} animate={{ opacity: 1 }} className="text-sm text-white/50">
                   Thinking through the lookbook…
                 </motion.p>
@@ -100,4 +100,3 @@ export function MoodboardPlanner() {
     </section>
   );
 }
-
