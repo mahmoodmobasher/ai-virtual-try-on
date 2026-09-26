@@ -31,6 +31,7 @@ import cv2
 from loguru import logger
 
 from ..core.config import get_settings
+from .nose_ring import draw_nose_ring, smooth_keypoint_track
 from .pipelines.tryon_pipeline import TryOnPipeline
 from .segmentation_service import FaceSwapSlot, get_segmentation_service
 
@@ -278,6 +279,7 @@ class VideoTryOnEngine:
         max_frames: Optional[int] = None,
         frame_stride: int = 1,
         frame_workers: Optional[int] = None,
+        nose_ring: bool = False,
         progress_cb: Optional[ProgressCallback] = None,
         should_stop: Optional[Callable[[], bool]] = None,
     ) -> Path:
@@ -296,6 +298,10 @@ class VideoTryOnEngine:
         `frame_stride`, `should_stop` and the audio restore behave as they do in
         `run()`: stride reuses the previous swapped frame for skipped ones, and
         stopping early still assembles the frames finished so far.
+
+        `nose_ring` adds a gold hoop to each swapped person's left nostril. It
+        runs as a second pass once swapping is done, because the landmarks it
+        is placed from need smoothing across neighbouring frames first.
         """
         frame_stride = max(1, frame_stride)
         workers = frame_workers or self.settings.effective_faceswap_frame_workers
@@ -316,6 +322,8 @@ class VideoTryOnEngine:
 
             progress_lock = threading.Lock()
             completed = 0
+            # Each swapped frame's per-slot landmarks, for the nose ring pass.
+            frame_kps: dict[int, list] = {}
 
             def swap_frame(index: int) -> None:
                 nonlocal completed
@@ -323,8 +331,10 @@ class VideoTryOnEngine:
                 frame = cv2.imread(str(frame_path))
                 if frame is None:
                     raise VideoProcessingError(f"Failed to read extracted frame '{frame_path.name}'.")
-                cv2.imwrite(str(frames_out_dir / frame_path.name), segmentation.swap_faces_multi(frame, slots))
+                swapped, slot_kps = segmentation.swap_faces_multi(frame, slots)
+                cv2.imwrite(str(frames_out_dir / frame_path.name), swapped)
                 with progress_lock:
+                    frame_kps[index] = slot_kps
                     completed += 1
                     if progress_cb:
                         progress_cb(min(completed * frame_stride, frame_count), frame_count)
@@ -348,6 +358,13 @@ class VideoTryOnEngine:
 
             if not swapped_indices:
                 raise VideoProcessingError("Stopped before any frames were processed.")
+
+            if nose_ring:
+                self._add_nose_rings(
+                    [frames_out_dir / input_frames[index].name for index in swapped_indices],
+                    [frame_kps[index] for index in swapped_indices],
+                    workers=workers,
+                )
 
             # Fill the frames skipped by frame_stride with the most recent
             # swapped frame. A completed run pads out to the end of the video;
@@ -373,6 +390,32 @@ class VideoTryOnEngine:
             return output_path
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
+
+    @staticmethod
+    def _add_nose_rings(frame_paths: Sequence[Path], frame_kps: Sequence[list], *, workers: int) -> None:
+        """Draw the nose ring onto already-swapped frames, in place.
+
+        `frame_kps[i]` holds each slot's landmarks for `frame_paths[i]`. Every
+        slot's track is smoothed over time before drawing, so the ring stays
+        put on the nose instead of shimmering with per-frame landmark noise.
+        """
+        slot_count = len(frame_kps[0]) if frame_kps else 0
+        smoothed_tracks = [
+            smooth_keypoint_track([kps[slot] for kps in frame_kps]) for slot in range(slot_count)
+        ]
+
+        def ring_frame(position: int) -> None:
+            frame_path = frame_paths[position]
+            frame = cv2.imread(str(frame_path))
+            if frame is None:
+                raise VideoProcessingError(f"Failed to read swapped frame '{frame_path.name}'.")
+            for track in smoothed_tracks:
+                if track[position] is not None:
+                    frame = draw_nose_ring(frame, track[position])
+            cv2.imwrite(str(frame_path), frame)
+
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="nose-ring") as pool:
+            list(pool.map(ring_frame, range(len(frame_paths))))
 
 
 _engine: Optional[VideoTryOnEngine] = None

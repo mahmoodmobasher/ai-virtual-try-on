@@ -25,6 +25,7 @@ export default function FaceSwapVideoPage() {
   const [replacements, setReplacements] = useState<Record<number, Replacement | null>>({});
   const [frameStride, setFrameStride] = useState<number>(1);
   const [maxFrames, setMaxFrames] = useState<number | "">("");
+  const [noseRing, setNoseRing] = useState(false);
   const [job, setJob] = useState<VideoJob | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isStopping, setIsStopping] = useState(false);
@@ -142,6 +143,7 @@ export default function FaceSwapVideoPage() {
       formData.append("target_face_indices", faceIndex.toString());
     });
     formData.append("frame_stride", frameStride.toString());
+    formData.append("nose_ring", noseRing.toString());
     if (maxFrames !== "" && Number.isFinite(Number(maxFrames))) {
       formData.append("max_frames", Number(maxFrames).toString());
     }
@@ -323,6 +325,23 @@ export default function FaceSwapVideoPage() {
                 />
               </label>
             </div>
+
+            <label className="flex items-start gap-3 rounded-2xl border border-white/10 bg-black/30 p-4 text-sm">
+              <input
+                type="checkbox"
+                checked={noseRing}
+                onChange={(event) => setNoseRing(event.target.checked)}
+                disabled={isRunning}
+                className="mt-0.5 h-4 w-4 accent-amber-400"
+              />
+              <span className="flex flex-col gap-1">
+                <span className="font-semibold text-white/70">Add nose ring</span>
+                <span className="text-xs text-white/40">
+                  Adds a gold hoop to the left nostril of each swapped face. It follows the face as it moves and
+                  fades out when the head turns that side away from the camera.
+                </span>
+              </span>
+            </label>
 
             {error ? <p className="text-sm text-red-400">{error}</p> : null}
 

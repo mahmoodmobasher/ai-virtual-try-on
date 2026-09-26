@@ -353,6 +353,7 @@ def _run_video_faceswap_job(
     fps: float | None,
     max_frames: int | None,
     frame_stride: int,
+    nose_ring: bool,
 ) -> None:
     job = _video_faceswap_jobs[job_id]
     job.status = "processing"
@@ -373,6 +374,7 @@ def _run_video_faceswap_job(
             fps=fps,
             max_frames=max_frames,
             frame_stride=frame_stride,
+            nose_ring=nose_ring,
             progress_cb=on_progress,
             should_stop=cancel_event.is_set,
         )
@@ -397,12 +399,14 @@ async def create_video_faceswap_job(
     fps: float | None = Form(default=None),
     max_frames: int | None = Form(default=None),
     frame_stride: int = Form(default=1),
+    nose_ring: bool = Form(default=False),
 ) -> VideoTryOnJob:
     """Replace the chosen people throughout a previously scanned video.
 
     `target_face_indices` selects which faces from POST /video/faceswap/scan to
     replace; `source_face_images` supplies the replacement face for each, in the
-    same order. Body, pose and audio are preserved.
+    same order. Body, pose and audio are preserved. `nose_ring` adds a gold
+    hoop to each swapped person's left nostril.
     """
     scan = _video_faceswap_scans.get(upload_id)
     if scan is None:
@@ -466,6 +470,7 @@ async def create_video_faceswap_job(
         fps=fps,
         max_frames=max_frames,
         frame_stride=frame_stride,
+        nose_ring=nose_ring,
     )
 
     return job

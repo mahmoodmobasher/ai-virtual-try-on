@@ -242,21 +242,27 @@ class SegmentationService:
 
         return (mask * warped_face + (1 - mask) * frame.astype(np.float32)).astype(np.uint8)
 
-    def swap_faces_multi(self, frame: np.ndarray, slots: Sequence[FaceSwapSlot]) -> np.ndarray:
+    def swap_faces_multi(
+        self, frame: np.ndarray, slots: Sequence[FaceSwapSlot]
+    ) -> tuple[np.ndarray, list[Optional[np.ndarray]]]:
         """Swap every slot's assigned person in `frame`, matching them by identity.
 
         One detection pass serves every slot, and each slot claims the face
         whose identity matches the person the user picked — so a slot follows
         that person across frames regardless of where they move or how large
         they appear. Faces nobody claimed are left untouched.
+
+        Also returns each slot's 5-point landmarks in this frame (None where
+        that person wasn't found), for overlays drawn after the swap.
         """
+        slot_kps: list[Optional[np.ndarray]] = [None] * len(slots)
         detected = self.face_app.get(frame)
         if not detected:
-            return frame
+            return frame, slot_kps
 
         claimed: set[int] = set()
         matches: list[tuple[FaceSwapSlot, Any]] = []
-        for slot in slots:
+        for slot_index, slot in enumerate(slots):
             # Matched against `detected`, captured before any swapping, so
             # embeddings still describe the original people even after an
             # earlier slot has already altered the frame.
@@ -267,9 +273,10 @@ class SegmentationService:
                 continue
             claimed.add(id(match))
             matches.append((slot, match))
+            slot_kps[slot_index] = match.kps.copy()
 
         if not matches:
-            return frame
+            return frame, slot_kps
 
         # Every face's network pass runs first, then compositing happens in slot
         # order, so overlapping faces blend deterministically. This stays
@@ -282,7 +289,7 @@ class SegmentationService:
         for bgr_fake, matrix in swapped:
             result = self._paste_swapped(result, bgr_fake, matrix)
 
-        return result
+        return result, slot_kps
 
     def align_face(self, image: np.ndarray, landmarks: np.ndarray, output_size: int = 512) -> np.ndarray:
         """
