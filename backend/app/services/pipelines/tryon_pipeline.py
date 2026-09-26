@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import cv2
 import numpy as np
@@ -100,6 +100,7 @@ class TryOnPipeline:
         prompt: str | None = None,
         mode: str = "garment_swap",
         category: str = "auto",
+        progress_cb: Optional[Callable[[int, int], None]] = None,
     ) -> Path:
         """
         Generate try-on result with preprocessing.
@@ -111,6 +112,9 @@ class TryOnPipeline:
             prompt: Optional text prompt for CatVTON-FLUX / FASHN Try-On Max.
             mode: "garment_swap", "face_swap" or "catvton_flux" (legacy "viton_hd" accepted).
             category: Garment category for clothes swap: auto, tops, bottoms or one-pieces.
+            progress_cb: Optional callback(step, total_steps) reporting diffusion progress.
+                Only honored by the local garment_swap engine; other engines/modes don't
+                have a comparable step-wise notion of progress.
         """
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -128,7 +132,7 @@ class TryOnPipeline:
                     user_image_path, garment_image_path, output_path, category=category, prompt=prompt
                 )
             return get_local_tryon_engine().try_on(
-                user_image_path, garment_image_path, output_path, category=category
+                user_image_path, garment_image_path, output_path, category=category, progress_cb=progress_cb
             )
 
         if mode in {"catvton_flux", "viton_hd"}:

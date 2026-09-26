@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile, status
 
 from ..core.dependencies import SessionDep
 from ..models import Garment, TryOnJob, TryOnJobRead
@@ -13,9 +13,10 @@ SUPPORTED_MODES = {"garment_swap", "face_swap"}
 service = TryOnService()
 
 
-@router.post("/", response_model=TryOnJobRead, status_code=status.HTTP_201_CREATED)
+@router.post("/", response_model=TryOnJobRead, status_code=status.HTTP_202_ACCEPTED)
 async def create_tryon_job(
     session: SessionDep,
+    background_tasks: BackgroundTasks,
     garment_id: int | None = Form(None),
     user_reference: str | None = Form(None),
     prompt: str | None = Form(None),
@@ -66,6 +67,7 @@ async def create_tryon_job(
         mode=mode,
         category=category,
     )
+    background_tasks.add_task(service.run_job, job.id)
     return TryOnJobRead.model_validate(job)
 
 
@@ -74,4 +76,8 @@ async def get_tryon_job(job_id: int, session: SessionDep) -> TryOnJob:
     job = await session.get(TryOnJob, job_id)
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Try-on job not found")
-    return TryOnJobRead.model_validate(job)
+    result = TryOnJobRead.model_validate(job)
+    progress = service.get_progress(job_id)
+    if progress:
+        result.progress_current, result.progress_total = progress
+    return result

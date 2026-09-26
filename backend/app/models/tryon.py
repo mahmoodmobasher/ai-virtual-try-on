@@ -42,4 +42,10 @@ class TryOnJobRead(SQLModel):
     meta: dict | None = None
     created_at: datetime
     updated_at: datetime
+    # Not persisted columns: filled in by the router from the service's in-memory
+    # progress store, so the frontend can render a real progress bar while a job
+    # is processing. Absent/None means "no step-wise progress available" (e.g. a
+    # hosted engine, or before the first step has run).
+    progress_current: int | None = None
+    progress_total: int | None = None
 

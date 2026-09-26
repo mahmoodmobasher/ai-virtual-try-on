@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Optional
@@ -43,10 +44,24 @@ class Settings(BaseSettings):
     # must never leave this machine. Set to false only if you deliberately want the
     # hosted API and accept that images will be uploaded to a third party.
     enforce_local_only: bool = True
-    local_tryon_width: int = 768
-    local_tryon_height: int = 1024
-    local_tryon_steps: int = 30
+    local_tryon_width: int = 640
+    local_tryon_height: int = 854
+    local_tryon_steps: int = 20
     local_tryon_guidance_scale: float = 2.5
+
+    # Hard wall-clock limit for a single try-on generation. If exceeded, the
+    # worker process running it is killed outright (its memory is reclaimed by
+    # the OS immediately) instead of letting a runaway job hang the machine.
+    tryon_timeout_seconds: int = 120
+    # CPU threads PyTorch is allowed to use for a try-on job. Left unset (None),
+    # it defaults to "all cores minus a couple", so the model doesn't peg every
+    # core and make the whole machine unresponsive during inference.
+    tryon_cpu_threads: Optional[int] = None
+
+    # Video frames swapped concurrently in a face-swap job. The face-swap models
+    # spend most of their time on the GPU/ANE, which saturates around four
+    # in-flight frames; past that the extra threads just queue.
+    faceswap_frame_workers: int = 4
 
     # FASHN hosted try-on API (clothes swap)
     fashn_api_key: Optional[str] = None
@@ -61,17 +76,6 @@ class Settings(BaseSettings):
     catvton_num_steps: int = 30
     catvton_guidance_scale: float = 30.0
     catvton_seed: int = 1337
-
-    # Stable Video Diffusion configuration (experimental)
-    svd_model_id: str = "stabilityai/stable-video-diffusion-img2vid-xt"
-    svd_default_frames: int = 14
-    svd_default_fps: int = 6
-    svd_inference_steps: int = 25
-    svd_guidance_scale: float = 1.2
-    svd_motion_bucket_id: int = 127
-    svd_noise_aug_strength: float = 0.02
-    svd_image_width: int = 576
-    svd_image_height: int = 576
 
     # Legacy LLM Studio config (deprecated)
     llm_studio_base_url: Optional[str] = None
@@ -105,6 +109,17 @@ class Settings(BaseSettings):
     @property
     def video_results_dir(self) -> Path:
         return Path(self.storage_dir) / "video-results"
+
+    @property
+    def effective_faceswap_frame_workers(self) -> int:
+        return max(1, min(self.faceswap_frame_workers, os.cpu_count() or 4))
+
+    @property
+    def effective_tryon_cpu_threads(self) -> int:
+        if self.tryon_cpu_threads is not None:
+            return max(1, self.tryon_cpu_threads)
+        cpu_count = os.cpu_count() or 4
+        return max(1, cpu_count - 2)
 
 
 @lru_cache

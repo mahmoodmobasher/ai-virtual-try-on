@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -99,6 +100,7 @@ class CatVTONPipeline:
         num_inference_steps: int = 50,
         guidance_scale: float = 2.5,
         seed: int = 42,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
     ) -> Image.Image:
         """All three images must already share the same size (a multiple of 8)."""
         concat_dim = -2  # stack person above garment
@@ -130,7 +132,7 @@ class CatVTONPipeline:
         masked_latent_concat = masked_latent_concat.to(self.unet_dtype)
         mask_latent_concat = mask_latent_concat.to(self.unet_dtype)
 
-        for t in self.scheduler.timesteps:
+        for step_index, t in enumerate(self.scheduler.timesteps):
             model_input = torch.cat([latents] * 2) if do_cfg else latents
             model_input = self.scheduler.scale_model_input(model_input, t)
             model_input = torch.cat([model_input, mask_latent_concat, masked_latent_concat], dim=1)
@@ -139,6 +141,8 @@ class CatVTONPipeline:
                 noise_uncond, noise_cond = noise_pred.chunk(2)
                 noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
             latents = self.scheduler.step(noise_pred, t, latents, eta=1.0, generator=generator).prev_sample
+            if progress_cb:
+                progress_cb(step_index + 1, num_inference_steps)
 
         latents = latents.split(latents.shape[concat_dim] // 2, dim=concat_dim)[0]
         latents = latents.to(self.vae_dtype) / self.vae.config.scaling_factor

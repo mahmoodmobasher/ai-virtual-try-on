@@ -20,15 +20,19 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 from uuid import uuid4
 
+import cv2
 from loguru import logger
 
 from ..core.config import get_settings
 from .pipelines.tryon_pipeline import TryOnPipeline
+from .segmentation_service import FaceSwapSlot, get_segmentation_service
 
 ProgressCallback = Callable[[int, int], None]
 
@@ -187,6 +191,7 @@ class VideoTryOnEngine:
         frame_stride: int = 1,
         frame_slot: str = "user_image",
         progress_cb: Optional[ProgressCallback] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> Path:
         """Process `video_path` frame-by-frame and write the result to `output_path`.
 
@@ -202,6 +207,11 @@ class VideoTryOnEngine:
         frame_stride > 1 processes every Nth frame through the (expensive) try-on
         pipeline and reuses the previous processed frame for the skipped ones,
         trading temporal detail for speed.
+
+        `should_stop`, if given, is polled before each frame; when it returns
+        True the loop stops early and the video is assembled from whatever
+        frames were already processed, so the caller gets a finished (shorter)
+        video instead of losing all progress.
         """
         frame_stride = max(1, frame_stride)
         work_dir = self.settings.storage_dir / "tmp" / f"video-tryon-{uuid4().hex}"
@@ -219,6 +229,10 @@ class VideoTryOnEngine:
             last_output_frame: Path | None = None
 
             for index, frame_path in enumerate(input_frames):
+                if should_stop and should_stop():
+                    logger.info("Video try-on stopped early by request at frame {}/{}", index, frame_count)
+                    break
+
                 out_frame_path = frames_out_dir / frame_path.name
 
                 if index % frame_stride == 0 or last_output_frame is None:
@@ -250,6 +264,112 @@ class VideoTryOnEngine:
                 shutil.copyfile(silent_output_path, output_path)
 
             logger.info("Video try-on result saved to {}", output_path)
+            return output_path
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    def run_face_swap_multi(
+        self,
+        video_path: Path,
+        output_path: Path,
+        slots: Sequence[FaceSwapSlot],
+        *,
+        fps: Optional[float] = None,
+        max_frames: Optional[int] = None,
+        frame_stride: int = 1,
+        frame_workers: Optional[int] = None,
+        progress_cb: Optional[ProgressCallback] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+    ) -> Path:
+        """Swap one or two chosen people throughout `video_path`.
+
+        Unlike `run()`, which reuses the garment pipeline and re-detects the
+        single largest face every frame, each slot here carries the identity of
+        the person the user picked, so the right person is swapped even as
+        people move around each other.
+
+        Frames are swapped concurrently (`frame_workers`), which is where the
+        throughput comes from: the models are GPU/ANE-bound, so overlapping
+        whole frames keeps the accelerator busy. Slots are read-only during the
+        run, so sharing them across those threads is safe.
+
+        `frame_stride`, `should_stop` and the audio restore behave as they do in
+        `run()`: stride reuses the previous swapped frame for skipped ones, and
+        stopping early still assembles the frames finished so far.
+        """
+        frame_stride = max(1, frame_stride)
+        workers = frame_workers or self.settings.effective_faceswap_frame_workers
+        segmentation = get_segmentation_service()
+        work_dir = self.settings.storage_dir / "tmp" / f"video-faceswap-{uuid4().hex}"
+        frames_in_dir = work_dir / "frames_in"
+        frames_out_dir = work_dir / "frames_out"
+
+        try:
+            info = probe_video(video_path)
+            effective_fps = fps or info.fps
+
+            frame_count = extract_frames(video_path, frames_in_dir, fps=effective_fps, max_frames=max_frames)
+            frames_out_dir.mkdir(parents=True, exist_ok=True)
+
+            input_frames = sorted(frames_in_dir.glob("*.png"))
+            swap_indices = range(0, len(input_frames), frame_stride)
+
+            progress_lock = threading.Lock()
+            completed = 0
+
+            def swap_frame(index: int) -> None:
+                nonlocal completed
+                frame_path = input_frames[index]
+                frame = cv2.imread(str(frame_path))
+                if frame is None:
+                    raise VideoProcessingError(f"Failed to read extracted frame '{frame_path.name}'.")
+                cv2.imwrite(str(frames_out_dir / frame_path.name), segmentation.swap_faces_multi(frame, slots))
+                with progress_lock:
+                    completed += 1
+                    if progress_cb:
+                        progress_cb(min(completed * frame_stride, frame_count), frame_count)
+
+            # Submitted in order and every submitted frame is awaited, so the
+            # frames that finish always form a prefix of the video — a stopped
+            # job yields a shorter clip rather than one with holes in it.
+            swapped_indices: list[int] = []
+            stopped = False
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="faceswap-frame") as pool:
+                pending = []
+                for index in swap_indices:
+                    if should_stop and should_stop():
+                        logger.info("Video face swap stopped early by request at frame {}/{}", index, frame_count)
+                        stopped = True
+                        break
+                    pending.append((index, pool.submit(swap_frame, index)))
+                for index, future in pending:
+                    future.result()
+                    swapped_indices.append(index)
+
+            if not swapped_indices:
+                raise VideoProcessingError("Stopped before any frames were processed.")
+
+            # Fill the frames skipped by frame_stride with the most recent
+            # swapped frame. A completed run pads out to the end of the video;
+            # a stopped one ends at the last frame actually swapped.
+            fill_until = max(swapped_indices) + 1 if stopped else len(input_frames)
+            last_swapped: Path | None = None
+            for index in range(fill_until):
+                out_frame_path = frames_out_dir / input_frames[index].name
+                if out_frame_path.exists():
+                    last_swapped = out_frame_path
+                elif last_swapped is not None:
+                    shutil.copyfile(last_swapped, out_frame_path)
+
+            silent_output_path = work_dir / "silent_output.mp4"
+            merge_frames(frames_out_dir, silent_output_path, fps=effective_fps)
+
+            if info.has_audio:
+                mux_audio(silent_output_path, video_path, output_path)
+            else:
+                shutil.copyfile(silent_output_path, output_path)
+
+            logger.info("Video face swap result saved to {}", output_path)
             return output_path
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)

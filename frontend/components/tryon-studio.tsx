@@ -121,6 +121,7 @@ export function TryOnStudio() {
       } else if (job.status === "failed") {
         setState({ status: "error", error: job.failure_reason ?? "Processing failed", job });
       } else {
+        setState((prev) => ({ ...prev, status: "processing", job }));
         setTimeout(() => {
           if (isMounted.current) pollJob(jobId);
         }, 1500);
@@ -166,6 +167,10 @@ export function TryOnStudio() {
   };
 
   const garmentImageUrl = garmentPreview;
+  const isRunning = state.status === "uploading" || state.status === "processing";
+  const progressCurrent = state.job?.progress_current ?? 0;
+  const progressTotal = state.job?.progress_total ?? 0;
+  const progressPct = progressTotal > 0 ? Math.round((progressCurrent / progressTotal) * 100) : 0;
 
   return (
     <section id="studio" className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-6">
@@ -341,6 +346,23 @@ export function TryOnStudio() {
               <span className="rounded-full bg-white/10 px-3 py-1 text-white/70">Result</span>
               <span>Status: {state.status.toUpperCase()}</span>
             </div>
+            {isRunning ? (
+              <div className="mt-3">
+                <div className="h-2 w-full overflow-hidden rounded-full bg-white/10">
+                  <div
+                    className={
+                      progressTotal
+                        ? "h-full bg-brand-500 transition-all"
+                        : "h-full w-1/3 animate-pulse bg-brand-500/60"
+                    }
+                    style={progressTotal ? { width: `${progressPct}%` } : undefined}
+                  />
+                </div>
+                <p className="mt-1 text-xs text-white/50">
+                  {progressTotal ? `Step ${progressCurrent} / ${progressTotal} (${progressPct}%)` : "Generating…"}
+                </p>
+              </div>
+            ) : null}
             <div className="relative mt-4 flex h-[600px] w-full items-center justify-center overflow-hidden rounded-3xl bg-black/30">
               <AnimatePresence>
                 {state.previewUrl ? (

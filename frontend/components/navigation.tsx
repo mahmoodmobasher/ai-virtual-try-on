@@ -4,12 +4,7 @@ import Link from "next/link";
 import { useState } from "react";
 
 const links = [
-  { href: "#platform", label: "Platform" },
-  { href: "#studio", label: "Try-On Studio" },
-  { href: "#planner", label: "Moodboard" },
-  { href: "#analytics", label: "Insights" },
-  { href: "#pricing", label: "Pricing" },
-  { href: "/video-lab", label: "Video Lab" },
+  { href: "/#studio", label: "Try-On Studio" },
   { href: "/face-swap-video", label: "Face Swap Video" }
 ];
 
@@ -34,12 +29,6 @@ export function Navigation() {
               {link.label}
             </Link>
           ))}
-          <Link
-            href="#demo"
-            className="rounded-full bg-white px-5 py-2 text-sm font-semibold text-black shadow-neon transition hover:scale-[1.02]"
-          >
-            Book Live Demo
-          </Link>
         </div>
       </nav>
       {open ? (
@@ -50,17 +39,9 @@ export function Navigation() {
                 {link.label}
               </Link>
             ))}
-            <Link
-              href="#demo"
-              onClick={() => setOpen(false)}
-              className="rounded-full bg-white px-5 py-2 text-center font-semibold text-black"
-            >
-              Book Live Demo
-            </Link>
           </div>
         </div>
       ) : null}
     </header>
   );
 }
-

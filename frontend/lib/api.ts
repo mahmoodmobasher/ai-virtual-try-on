@@ -22,6 +22,10 @@ export type TryOnJob = {
   result_image_path?: string | null;
   failure_reason?: string | null;
   meta?: Record<string, unknown> | null;
+  // Diffusion step progress; null/undefined means no step-wise progress is
+  // available yet (e.g. before the first step, or a hosted engine).
+  progress_current?: number | null;
+  progress_total?: number | null;
 };
 
 export async function fetchGarments(): Promise<Garment[]> {
@@ -43,25 +47,9 @@ export async function getTryOnJob(jobId: number): Promise<TryOnJob> {
   return data;
 }
 
-export type VideoClipResponse = {
-  result_video_path: string;
-  frames: number;
-  fps: number;
-  duration_seconds: number;
-};
-
-export async function createVideoClip(form: FormData): Promise<VideoClipResponse> {
-  console.log("[API] Sending POST request to", `${API_BASE}/video/clip`);
-  const { data } = await axios.post<VideoClipResponse>(`${API_BASE}/video/clip`, form, {
-    headers: { "Content-Type": "multipart/form-data" }
-  });
-  console.log("[API] Received video clip response:", data);
-  return data;
-}
-
 export type VideoJob = {
   job_id: string;
-  status: "pending" | "processing" | "completed" | "failed";
+  status: "pending" | "processing" | "completed" | "failed" | "cancelled";
   frames_done: number;
   frames_total: number;
   result_video_path?: string | null;
@@ -69,8 +57,26 @@ export type VideoJob = {
   created_at: number;
 };
 
+export type DetectedFace = {
+  face_index: number;
+  bbox: number[];
+  det_score: number;
+  thumbnail_url: string;
+};
+
+export type FaceScanResult = {
+  upload_id: string;
+  faces: DetectedFace[];
+};
+
+export async function scanVideoFaces(form: FormData): Promise<FaceScanResult> {
+  const { data } = await axios.post<FaceScanResult>(`${API_BASE}/video/faceswap/scan`, form, {
+    headers: { "Content-Type": "multipart/form-data" }
+  });
+  return data;
+}
+
 export async function createVideoFaceSwap(form: FormData): Promise<VideoJob> {
-  console.log("[API] Sending POST request to", `${API_BASE}/video/faceswap`);
   const { data } = await axios.post<VideoJob>(`${API_BASE}/video/faceswap`, form, {
     headers: { "Content-Type": "multipart/form-data" }
   });
@@ -79,5 +85,10 @@ export async function createVideoFaceSwap(form: FormData): Promise<VideoJob> {
 
 export async function getVideoFaceSwapJob(jobId: string): Promise<VideoJob> {
   const { data } = await axios.get<VideoJob>(`${API_BASE}/video/faceswap/${jobId}`);
+  return data;
+}
+
+export async function cancelVideoFaceSwapJob(jobId: string): Promise<VideoJob> {
+  const { data } = await axios.post<VideoJob>(`${API_BASE}/video/faceswap/${jobId}/cancel`);
   return data;
 }
