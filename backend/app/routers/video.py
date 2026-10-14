@@ -168,7 +168,7 @@ async def get_video_tryon_job(job_id: str) -> VideoTryOnJob:
 # InsightFace); nothing is uploaded anywhere.
 # ----------------------------------------------------------------------
 
-MAX_SWAP_FACES = 2
+MAX_SWAP_FACES = 3
 # Frames sampled evenly across the video when scanning for faces. Enough to
 # catch people who only appear partway through, without making the scan drag.
 SCAN_SAMPLE_FRAMES = 12
@@ -193,6 +193,8 @@ class DetectedFace(BaseModel):
 
 class FaceScanResult(BaseModel):
     upload_id: str
+    # Reported so the UI enforces the same cap as the submit endpoint.
+    max_swap_faces: int = MAX_SWAP_FACES
     faces: list[DetectedFace]
 
 

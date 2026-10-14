@@ -65,6 +65,7 @@ export type DetectedFace = {
 };
 
 export type FaceScanResult = {
+  max_swap_faces: number;
   upload_id: string;
   faces: DetectedFace[];
 };

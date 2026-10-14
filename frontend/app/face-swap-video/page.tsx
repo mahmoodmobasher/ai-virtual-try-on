@@ -13,7 +13,8 @@ import {
   scanVideoFaces
 } from "@/lib/api";
 
-const MAX_FACES = 2;
+// Fallback until the scan response reports the backend's cap.
+const DEFAULT_MAX_FACES = 3;
 
 type Replacement = { file: File; preview: string };
 
@@ -22,6 +23,7 @@ export default function FaceSwapVideoPage() {
   const [targetVideoPreview, setTargetVideoPreview] = useState<string | null>(null);
   const [isScanning, setIsScanning] = useState(false);
   const [scan, setScan] = useState<FaceScanResult | null>(null);
+  const maxFaces = scan?.max_swap_faces ?? DEFAULT_MAX_FACES;
   const [replacements, setReplacements] = useState<Record<number, Replacement | null>>({});
   const [frameStride, setFrameStride] = useState<number>(1);
   const [maxFrames, setMaxFrames] = useState<number | "">("");
@@ -83,8 +85,8 @@ export default function FaceSwapVideoPage() {
         delete next[faceIndex];
         return next;
       }
-      if (Object.keys(next).length >= MAX_FACES) {
-        setError(`You can swap up to ${MAX_FACES} faces at a time.`);
+      if (Object.keys(next).length >= maxFaces) {
+        setError(`You can swap up to ${maxFaces} faces at a time.`);
         return current;
       }
       next[faceIndex] = null;
@@ -188,7 +190,7 @@ export default function FaceSwapVideoPage() {
           <h1 className="font-display text-4xl text-white">Face Swap Video (Experimental)</h1>
           <p className="max-w-2xl text-base text-white/60">
             Upload a video and the app scans the whole clip for faces, including people who only appear partway
-            through. Pick up to {MAX_FACES} of the people it finds, give each one a replacement photo, and every
+            through. Pick up to {maxFaces} of the people it finds, give each one a replacement photo, and every
             frame gets re-faced — body, pose and audio preserved. Each chosen person is tracked by face identity
             across frames, so the swap stays on the right person. Runs entirely on this machine.
           </p>
@@ -224,7 +226,7 @@ export default function FaceSwapVideoPage() {
                 <>
                   <p className="text-xs text-white/40">
                     Found {scan.faces.length} face{scan.faces.length === 1 ? "" : "s"}. Click the ones you want to
-                    replace (up to {MAX_FACES}), then add a photo for each.
+                    replace (up to {maxFaces}), then add a photo for each.
                   </p>
                   <div className="grid grid-cols-3 gap-3 sm:grid-cols-4">
                     {scan.faces.map((face) => {
