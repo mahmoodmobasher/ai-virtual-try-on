@@ -5,39 +5,20 @@ import clsx from "clsx";
 import { AnimatePresence, motion } from "framer-motion";
 import { useEffect, useRef, useState } from "react";
 
-import { BACKEND_BASE, createTryOn, getTryOnJob, TryOnJob } from "@/lib/api";
+import {
+  apiErrorMessage,
+  BACKEND_BASE,
+  createImageFaceSwap,
+  getTryOnJob,
+  ImageFaceScanResult,
+  scanImageFaces,
+  TryOnJob
+} from "@/lib/api";
 
-type TryOnMode = "garment_swap" | "face_swap";
-type GarmentCategory = "auto" | "tops" | "bottoms" | "one-pieces";
+// Used until a scan reports the backend's actual limit.
+const DEFAULT_MAX_FACES = 4;
 
-const MODE_COPY: Record<
-  TryOnMode,
-  { label: string; description: string; personLabel: string; garmentLabel: string; note: string; missing: string }
-> = {
-  garment_swap: {
-    label: "Clothes swap",
-    description: "The garment is dressed onto your photo while your face, body and pose stay the same.",
-    personLabel: "Upload your photo",
-    garmentLabel: "Upload garment photo",
-    note: "Use a clear, well-lit photo of yourself (half or full body). The garment can be a flat-lay, product shot or worn by another model.",
-    missing: "Upload a photo of yourself and a photo of the garment."
-  },
-  face_swap: {
-    label: "Face swap",
-    description: "Your face is placed on the reference model while their outfit and pose are preserved.",
-    personLabel: "Upload source face",
-    garmentLabel: "Upload reference model wearing outfit",
-    note: "Use two clear, front-facing photos. The result keeps the reference model's outfit and body while replacing their face with the source face.",
-    missing: "Upload a source face photo and a reference photo of someone wearing the outfit."
-  }
-};
-
-const CATEGORIES: { value: GarmentCategory; label: string }[] = [
-  { value: "auto", label: "Auto" },
-  { value: "tops", label: "Top" },
-  { value: "bottoms", label: "Bottom" },
-  { value: "one-pieces", label: "Full outfit" }
-];
+type Replacement = { file: File; preview: string };
 
 type TryOnState = {
   job?: TryOnJob;
@@ -47,54 +28,61 @@ type TryOnState = {
 };
 
 export function TryOnStudio() {
-  const [userImage, setUserImage] = useState<File | null>(null);
-  const [portraitPreview, setPortraitPreview] = useState<string | null>(null);
-  const [modelName, setModelName] = useState<string | null>(null);
+  const [photoPreview, setPhotoPreview] = useState<string | null>(null);
+  const [photoName, setPhotoName] = useState<string | null>(null);
+  const [isScanning, setIsScanning] = useState(false);
+  const [scan, setScan] = useState<ImageFaceScanResult | null>(null);
+  const [scanError, setScanError] = useState<string | null>(null);
+  // Chosen faces by scan index; null until a replacement photo is added.
+  const [replacements, setReplacements] = useState<Record<number, Replacement | null>>({});
   const [state, setState] = useState<TryOnState>({ status: "idle" });
-  const [tryOnMode, setTryOnMode] = useState<TryOnMode>("garment_swap");
-  const [category, setCategory] = useState<GarmentCategory>("auto");
-  const copy = MODE_COPY[tryOnMode];
   const isMounted = useRef(true);
-  const portraitObjectUrlRef = useRef<string | null>(null);
-  const uploadInputId = "tryon-upload-model";
-  const [garmentFile, setGarmentFile] = useState<File | null>(null);
-  const [garmentPreview, setGarmentPreview] = useState<string | null>(null);
-  const garmentObjectUrlRef = useRef<string | null>(null);
-  const garmentInputId = "garment-upload";
+  const photoObjectUrlRef = useRef<string | null>(null);
+  const replacementsRef = useRef(replacements);
+  replacementsRef.current = replacements;
+  // Guards against a slow scan of a previous photo landing after a newer upload.
+  const scanRequestRef = useRef(0);
+  const uploadInputId = "faceswap-upload-photo";
 
   useEffect(() => {
+    isMounted.current = true;
     return () => {
       isMounted.current = false;
-      if (portraitObjectUrlRef.current) {
-        URL.revokeObjectURL(portraitObjectUrlRef.current);
+      if (photoObjectUrlRef.current) {
+        URL.revokeObjectURL(photoObjectUrlRef.current);
       }
-      if (garmentObjectUrlRef.current) {
-        URL.revokeObjectURL(garmentObjectUrlRef.current);
-      }
+      Object.values(replacementsRef.current).forEach((entry) => entry && URL.revokeObjectURL(entry.preview));
     };
   }, []);
 
+  const maxFaces = scan?.max_swap_faces ?? DEFAULT_MAX_FACES;
+  const selectedIndices = Object.keys(replacements)
+    .map(Number)
+    .sort((a, b) => a - b);
+  const canGenerate = scan !== null && selectedIndices.length > 0 && selectedIndices.every((index) => replacements[index]);
+
   const mutation = useMutation({
     mutationFn: async () => {
-      if (!garmentFile || !userImage) {
-        throw new Error(copy.missing);
+      if (!scan || !canGenerate) {
+        throw new Error("Choose at least one face and add a replacement photo for it.");
       }
       const formData = new FormData();
-      formData.append("garment_image", garmentFile);
-      formData.append("user_image", userImage);
-      formData.append("mode", tryOnMode);
-      if (tryOnMode === "garment_swap") {
-        formData.append("category", category);
-      }
-      return createTryOn(formData);
+      formData.append("upload_id", scan.upload_id);
+      selectedIndices.forEach((faceIndex) => {
+        const entry = replacements[faceIndex];
+        if (!entry) return;
+        formData.append("source_face_images", entry.file);
+        formData.append("target_face_indices", faceIndex.toString());
+      });
+      return createImageFaceSwap(formData);
     },
     onMutate: () => {
       if (!isMounted.current) return;
-      setState((prev) => ({ ...prev, status: "uploading" }));
+      setState({ status: "uploading" });
     },
     onError: (error: Error) => {
       if (!isMounted.current) return;
-      setState((prev) => ({ ...prev, status: "error", error: error.message }));
+      setState((prev) => ({ ...prev, status: "error", error: apiErrorMessage(error, "Failed to start the face swap.") }));
     },
     onSuccess: async (job) => {
       if (job.status === "completed") {
@@ -133,40 +121,83 @@ export function TryOnStudio() {
     }
   };
 
-  const handleUpload = (fileList: FileList | null) => {
+  const clearSelection = () => {
+    Object.values(replacements).forEach((entry) => entry && URL.revokeObjectURL(entry.preview));
+    setReplacements({});
+    setScan(null);
+    setScanError(null);
+  };
+
+  const clearPhoto = () => {
+    scanRequestRef.current += 1;
+    if (photoObjectUrlRef.current) {
+      URL.revokeObjectURL(photoObjectUrlRef.current);
+      photoObjectUrlRef.current = null;
+    }
+    setPhotoPreview(null);
+    setPhotoName(null);
+    setIsScanning(false);
+    clearSelection();
+  };
+
+  const handleUpload = async (fileList: FileList | null) => {
     const file = fileList?.[0];
     if (!file) return;
 
-    setUserImage(file);
-    setModelName(file.name);
-    if (portraitObjectUrlRef.current) {
-      URL.revokeObjectURL(portraitObjectUrlRef.current);
-    }
+    clearPhoto();
     const objectUrl = URL.createObjectURL(file);
-    portraitObjectUrlRef.current = objectUrl;
-    setPortraitPreview(objectUrl);
-    setState({
-      status: "idle",
-      job: undefined,
-      previewUrl: undefined,
-      error: undefined
-    });
+    photoObjectUrlRef.current = objectUrl;
+    setPhotoPreview(objectUrl);
+    setPhotoName(file.name);
+    setState({ status: "idle" });
+
+    const requestId = scanRequestRef.current;
+    const formData = new FormData();
+    formData.append("image", file);
+    try {
+      setIsScanning(true);
+      const result = await scanImageFaces(formData);
+      if (!isMounted.current || scanRequestRef.current !== requestId) return;
+      setScan(result);
+      if (result.faces.length === 0) {
+        setScanError("No faces were found in that photo. Try one where the faces are clearly visible.");
+      } else if (result.faces.length === 1) {
+        // Only one person to pick, so pick them.
+        setReplacements({ [result.faces[0].face_index]: null });
+      }
+    } catch (error) {
+      if (!isMounted.current || scanRequestRef.current !== requestId) return;
+      setScanError(apiErrorMessage(error, "Failed to scan the photo for faces."));
+    } finally {
+      if (isMounted.current && scanRequestRef.current === requestId) setIsScanning(false);
+    }
   };
 
-  const handleGarmentUpload = (fileList: FileList | null) => {
+  const toggleFace = (faceIndex: number) => {
+    setScanError(null);
+    if (faceIndex in replacements) {
+      const entry = replacements[faceIndex];
+      if (entry) URL.revokeObjectURL(entry.preview);
+      const next = { ...replacements };
+      delete next[faceIndex];
+      setReplacements(next);
+      return;
+    }
+    if (selectedIndices.length >= maxFaces) {
+      setScanError(`You can swap up to ${maxFaces} faces at a time.`);
+      return;
+    }
+    setReplacements({ ...replacements, [faceIndex]: null });
+  };
+
+  const handleReplacementUpload = (faceIndex: number, fileList: FileList | null) => {
     const file = fileList?.[0];
     if (!file) return;
-
-    setGarmentFile(file);
-    if (garmentObjectUrlRef.current) {
-      URL.revokeObjectURL(garmentObjectUrlRef.current);
-    }
-    const objectUrl = URL.createObjectURL(file);
-    garmentObjectUrlRef.current = objectUrl;
-    setGarmentPreview(objectUrl);
+    const previous = replacements[faceIndex];
+    if (previous) URL.revokeObjectURL(previous.preview);
+    setReplacements({ ...replacements, [faceIndex]: { file, preview: URL.createObjectURL(file) } });
   };
 
-  const garmentImageUrl = garmentPreview;
   const isRunning = state.status === "uploading" || state.status === "processing";
   const progressCurrent = state.job?.progress_current ?? 0;
   const progressTotal = state.job?.progress_total ?? 0;
@@ -177,95 +208,76 @@ export function TryOnStudio() {
       <header className="flex flex-col gap-2">
         <h2 className="font-display text-4xl text-white">Try-On Studio</h2>
         <p className="max-w-3xl text-base text-white/60">
-          Upload a model photo and a garment, choose clothes swap or face swap, and generate the result.
+          Upload a photo and the app finds every face in it. Pick up to {maxFaces} of them, give each a replacement
+          face, and generate — outfit, body and pose stay exactly as they are.
         </p>
       </header>
 
       <div className="flex flex-col gap-6 xl:flex-row">
         <aside className="flex w-full flex-col gap-4 xl:max-w-sm">
-          <div className="rounded-3xl border border-brand-500/40 bg-brand-500/10 p-5">
-            <p className="text-xs uppercase tracking-[0.3em] text-white/50">Mode</p>
-            <div className="mt-3 flex gap-2 rounded-full bg-black/30 p-1">
-              {(Object.keys(MODE_COPY) as TryOnMode[]).map((mode) => (
-                <button
-                  key={mode}
-                  onClick={() => {
-                    setTryOnMode(mode);
-                    setState({ status: "idle" });
-                  }}
-                  className={clsx(
-                    "w-1/2 rounded-full px-4 py-2 text-sm transition",
-                    tryOnMode === mode ? "bg-white text-black shadow-neon" : "text-white/70"
-                  )}
-                >
-                  {MODE_COPY[mode].label}
-                </button>
-              ))}
-            </div>
-            <p className="mt-3 text-xs text-white/60">{copy.description}</p>
-            {tryOnMode === "garment_swap" ? (
-              <div className="mt-4">
-                <p className="text-xs uppercase tracking-[0.3em] text-white/50">Garment type</p>
-                <div className="mt-2 grid grid-cols-4 gap-1 rounded-2xl bg-black/30 p-1">
-                  {CATEGORIES.map((option) => (
-                    <button
-                      key={option.value}
-                      onClick={() => setCategory(option.value)}
-                      className={clsx(
-                        "rounded-xl px-2 py-2 text-xs transition",
-                        category === option.value ? "bg-white text-black" : "text-white/70"
-                      )}
-                    >
-                      {option.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            ) : null}
-          </div>
-
           <div className="space-y-4 rounded-3xl border border-white/10 bg-white/5 p-5">
-            <p className="text-xs uppercase tracking-[0.3em] text-white/50">Upload model and clothes</p>
-
             <div className="space-y-2 rounded-2xl border border-dashed border-white/10 bg-black/30 p-4">
-              <p className="text-xs uppercase tracking-[0.3em] text-white/40">
-                {copy.personLabel}
-              </p>
-              <div className="relative flex h-80 w-full overflow-hidden rounded-3xl bg-[#0c0c18]">
-                {portraitPreview ? (
-                  <>
-                    <img src={portraitPreview} alt="Uploaded model" className="h-full w-full object-contain" />
-                    <button
-                      onClick={() => {
-                        setPortraitPreview(null);
-                        setUserImage(null);
-                        setModelName(null);
-                        if (portraitObjectUrlRef.current) {
-                          URL.revokeObjectURL(portraitObjectUrlRef.current);
-                          portraitObjectUrlRef.current = null;
-                        }
-                      }}
-                      className="absolute right-2 top-2 rounded-full bg-black/70 px-3 py-1 text-xs text-white/80 hover:bg-black"
-                    >
-                      ✕
-                    </button>
-                    {modelName ? (
-                      <span className="absolute bottom-3 right-3 rounded-full bg-black/70 px-3 py-1 text-xs text-white/80">
-                        {modelName}
-                      </span>
-                    ) : null}
-                  </>
-                ) : (
-                  <label
-                    htmlFor={uploadInputId}
-                    className="flex h-full w-full cursor-pointer items-center justify-center border border-dashed border-white/20 rounded-3xl text-white/60 transition hover:border-white/40 hover:bg-white/5"
+              <p className="text-xs uppercase tracking-[0.3em] text-white/40">1 · Upload photo</p>
+              {photoPreview ? (
+                <div className="relative overflow-hidden rounded-3xl bg-[#0c0c18]">
+                  <img src={photoPreview} alt="Uploaded photo" className="block h-auto w-full" />
+                  {scan?.faces.map((face) => {
+                    const [x1, y1, x2, y2] = face.bbox;
+                    const isSelected = face.face_index in replacements;
+                    return (
+                      <button
+                        key={face.face_index}
+                        type="button"
+                        onClick={() => toggleFace(face.face_index)}
+                        disabled={isRunning}
+                        aria-label={`Face ${face.face_index + 1}`}
+                        aria-pressed={isSelected}
+                        className={clsx(
+                          "absolute rounded-lg border-2 transition disabled:cursor-not-allowed",
+                          isSelected ? "border-brand-500 bg-brand-500/10" : "border-white/70 hover:border-white"
+                        )}
+                        style={{
+                          left: `${(x1 / scan.image_width) * 100}%`,
+                          top: `${(y1 / scan.image_height) * 100}%`,
+                          width: `${((x2 - x1) / scan.image_width) * 100}%`,
+                          height: `${((y2 - y1) / scan.image_height) * 100}%`
+                        }}
+                      >
+                        <span
+                          className={clsx(
+                            "absolute -left-0.5 -top-0.5 rounded-br-md rounded-tl-md px-1.5 text-[10px] font-semibold",
+                            isSelected ? "bg-brand-500 text-white" : "bg-white/80 text-black"
+                          )}
+                        >
+                          {face.face_index + 1}
+                        </span>
+                      </button>
+                    );
+                  })}
+                  <button
+                    onClick={() => {
+                      clearPhoto();
+                      setState({ status: "idle" });
+                    }}
+                    disabled={isRunning}
+                    className="absolute right-2 top-2 rounded-full bg-black/70 px-3 py-1 text-xs text-white/80 hover:bg-black disabled:opacity-60"
                   >
-                    <span className="text-sm uppercase tracking-[0.3em]">
-                      {copy.personLabel}
+                    ✕
+                  </button>
+                  {photoName ? (
+                    <span className="absolute bottom-3 right-3 max-w-[70%] truncate rounded-full bg-black/70 px-3 py-1 text-xs text-white/80">
+                      {photoName}
                     </span>
-                  </label>
-                )}
-              </div>
+                  ) : null}
+                </div>
+              ) : (
+                <label
+                  htmlFor={uploadInputId}
+                  className="flex h-80 w-full cursor-pointer items-center justify-center rounded-3xl border border-dashed border-white/20 bg-[#0c0c18] text-white/60 transition hover:border-white/40 hover:bg-white/5"
+                >
+                  <span className="text-center text-sm uppercase tracking-[0.3em]">Upload photo to re-face</span>
+                </label>
+              )}
               <input
                 id={uploadInputId}
                 type="file"
@@ -278,64 +290,116 @@ export function TryOnStudio() {
               />
             </div>
 
-            <div className="space-y-2 rounded-2xl border border-dashed border-white/10 bg-black/30 p-4">
-              <p className="text-xs uppercase tracking-[0.3em] text-white/40">
-                {copy.garmentLabel}
-              </p>
-              <div className="relative flex h-80 w-full overflow-hidden rounded-3xl bg-[#0c0c18]">
-                {garmentImageUrl ? (
-                  <>
-                    <img src={garmentImageUrl} alt="Garment" className="h-full w-full object-contain" />
-                    <button
-                      onClick={() => {
-                        setGarmentPreview(null);
-                        setGarmentFile(null);
-                        if (garmentObjectUrlRef.current) {
-                          URL.revokeObjectURL(garmentObjectUrlRef.current);
-                          garmentObjectUrlRef.current = null;
-                        }
-                      }}
-                      className="absolute right-2 top-2 rounded-full bg-black/70 px-3 py-1 text-xs text-white/80 hover:bg-black"
-                    >
-                      ✕
-                    </button>
-                  </>
-                ) : (
-                  <label
-                    htmlFor={garmentInputId}
-                    className="flex h-full w-full cursor-pointer items-center justify-center border border-dashed border-white/20 rounded-3xl text-white/60 transition hover:border-white/40 hover:bg-white/5"
-                  >
-                    <span className="text-center text-sm uppercase tracking-[0.3em]">
-                      {copy.garmentLabel}
-                    </span>
-                  </label>
-                )}
-              </div>
-              <input
-                id={garmentInputId}
-                type="file"
-                accept="image/*"
-                className="hidden"
-                onChange={(event) => {
-                  handleGarmentUpload(event.target.files);
-                  event.target.value = "";
-                }}
-              />
+            <div className="space-y-3 rounded-2xl border border-dashed border-white/10 bg-black/30 p-4">
+              <p className="text-xs uppercase tracking-[0.3em] text-white/40">2 · Choose faces to swap</p>
+              {isScanning ? (
+                <p className="text-sm text-white/50">Scanning the photo for faces…</p>
+              ) : !photoPreview ? (
+                <p className="text-xs text-white/40">Upload a photo first — its faces will show up here.</p>
+              ) : scan && scan.faces.length > 0 ? (
+                <>
+                  <p className="text-xs text-white/40">
+                    Found {scan.faces.length} face{scan.faces.length === 1 ? "" : "s"}. Click the ones you want to
+                    replace (up to {maxFaces}), then add a photo for each.
+                  </p>
+                  <div className="grid grid-cols-4 gap-2">
+                    {scan.faces.map((face) => {
+                      const isSelected = face.face_index in replacements;
+                      return (
+                        <button
+                          key={face.face_index}
+                          type="button"
+                          onClick={() => toggleFace(face.face_index)}
+                          disabled={isRunning}
+                          aria-pressed={isSelected}
+                          className={clsx(
+                            "relative overflow-hidden rounded-2xl border-2 transition disabled:cursor-not-allowed",
+                            isSelected ? "border-brand-500" : "border-white/10 opacity-70 hover:opacity-100"
+                          )}
+                        >
+                          <img
+                            src={`${BACKEND_BASE}${face.thumbnail_url}`}
+                            alt={`Face ${face.face_index + 1} from the photo`}
+                            className="aspect-square w-full object-cover"
+                          />
+                          <span className="absolute left-1 top-1 rounded-md bg-black/70 px-1.5 text-[10px] font-semibold text-white">
+                            {face.face_index + 1}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {selectedIndices.map((faceIndex) => {
+                    const face = scan.faces.find((item) => item.face_index === faceIndex);
+                    const entry = replacements[faceIndex];
+                    const inputId = `faceswap-replacement-${faceIndex}`;
+                    return (
+                      <div
+                        key={faceIndex}
+                        className="flex items-center gap-3 rounded-2xl border border-white/10 bg-black/30 p-3"
+                      >
+                        {face ? (
+                          <img
+                            src={`${BACKEND_BASE}${face.thumbnail_url}`}
+                            alt={`Face ${faceIndex + 1} from the photo`}
+                            className="h-14 w-14 shrink-0 rounded-xl object-cover"
+                          />
+                        ) : null}
+                        <span className="text-white/40">→</span>
+                        {entry ? (
+                          <img
+                            src={entry.preview}
+                            alt={`Replacement for face ${faceIndex + 1}`}
+                            className="h-14 w-14 shrink-0 rounded-xl object-cover"
+                          />
+                        ) : (
+                          <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-xl border border-dashed border-white/20 text-[10px] text-white/40">
+                            No photo
+                          </div>
+                        )}
+                        <label
+                          htmlFor={inputId}
+                          className={clsx(
+                            "ml-auto cursor-pointer rounded-full border border-white/20 px-3 py-2 text-xs text-white/80 transition hover:bg-white/10",
+                            isRunning && "pointer-events-none opacity-60"
+                          )}
+                        >
+                          {entry ? "Change" : "Add face"}
+                        </label>
+                        <input
+                          id={inputId}
+                          type="file"
+                          accept="image/*"
+                          className="hidden"
+                          disabled={isRunning}
+                          onChange={(event) => {
+                            handleReplacementUpload(faceIndex, event.target.files);
+                            event.target.value = "";
+                          }}
+                        />
+                      </div>
+                    );
+                  })}
+                </>
+              ) : null}
+              {scanError ? <p className="text-sm text-red-400">{scanError}</p> : null}
             </div>
 
             <div className="rounded-2xl bg-lime-200/20 p-4 text-xs text-lime-200">
               <p className="font-medium text-lime-100">Note</p>
               <p className="mt-1 text-lime-100/80">
-                {copy.note}
+                Use clear, front-facing replacement photos. If a replacement photo shows several people, its largest
+                face is used.
               </p>
             </div>
 
             <button
               onClick={() => mutation.mutate()}
-              disabled={mutation.isPending || !userImage || !garmentFile}
+              disabled={isRunning || isScanning || !canGenerate}
               className="w-full rounded-full bg-brand-500 py-3 text-sm font-semibold text-white shadow-neon transition hover:scale-[1.01] disabled:cursor-not-allowed disabled:bg-brand-500/40"
             >
-              {mutation.isPending ? "Generating…" : "Generate Try-On"}
+              {isRunning ? "Generating…" : "Generate Face Swap"}
             </button>
           </div>
         </aside>
@@ -359,7 +423,7 @@ export function TryOnStudio() {
                   />
                 </div>
                 <p className="mt-1 text-xs text-white/50">
-                  {progressTotal ? `Step ${progressCurrent} / ${progressTotal} (${progressPct}%)` : "Generating…"}
+                  {progressTotal ? `Face ${progressCurrent} / ${progressTotal} (${progressPct}%)` : "Generating…"}
                 </p>
               </div>
             ) : null}
@@ -373,15 +437,26 @@ export function TryOnStudio() {
                     exit={{ opacity: 0, scale: 0.98 }}
                     className="h-full w-full"
                   >
-                    <img src={state.previewUrl} alt="Try-on preview" className="h-full w-full object-contain" />
+                    <img src={state.previewUrl} alt="Face swap result" className="h-full w-full object-contain" />
                   </motion.div>
                 ) : (
                   <div className="flex flex-col items-center gap-2 text-sm text-white/50">
-                    <span>Upload a model and a garment, then generate to see the result here.</span>
+                    <span>Upload a photo, choose faces, then generate to see the result here.</span>
                   </div>
                 )}
               </AnimatePresence>
             </div>
+            {state.previewUrl ? (
+              <a
+                href={state.previewUrl}
+                download
+                target="_blank"
+                rel="noreferrer"
+                className="mt-4 inline-flex items-center justify-center rounded-full border border-white/20 px-5 py-2 text-sm font-semibold text-white transition hover:bg-white/10"
+              >
+                Open full-resolution PNG
+              </a>
+            ) : null}
             {state.error ? <p className="mt-3 text-sm text-red-400">Error: {state.error}</p> : null}
           </div>
         </div>

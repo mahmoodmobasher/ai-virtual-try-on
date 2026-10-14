@@ -28,3 +28,6 @@ backend/models/
 # Databases
 backend/tryon.db
 tryon.db
+
+# Next.js incremental build cache
+frontend/tsconfig.tsbuildinfo

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile, status
+from loguru import logger
+from pydantic import BaseModel
 
 from ..core.dependencies import SessionDep
 from ..models import Garment, TryOnJob, TryOnJobRead
 from ..services.fashn_client import GARMENT_CATEGORIES
 from ..services.garment_service import GarmentService
-from ..services.tryon_service import TryOnService
+from ..services.tryon_service import MAX_SWAP_FACES, TryOnService
 
 router = APIRouter(prefix="/tryon", tags=["try-on"])
 SUPPORTED_MODES = {"garment_swap", "face_swap"}
@@ -66,6 +70,135 @@ async def create_tryon_job(
         prompt=prompt,
         mode=mode,
         category=category,
+    )
+    background_tasks.add_task(service.run_job, job.id)
+    return TryOnJobRead.model_validate(job)
+
+
+# ----------------------------------------------------------------------
+# Face swap on a still photo: the photo is scanned for faces first, the
+# caller picks which of those people to replace (up to MAX_SWAP_FACES) and
+# supplies a replacement photo for each. Mirrors the video face-swap flow in
+# routers/video.py; the job itself is a regular TryOnJob, polled via
+# GET /tryon/{job_id}.
+# ----------------------------------------------------------------------
+
+
+class DetectedFace(BaseModel):
+    face_index: int
+    bbox: list[float]
+    det_score: float
+    thumbnail_url: str
+
+
+class FaceScanResult(BaseModel):
+    upload_id: str
+    image_width: int
+    image_height: int
+    max_swap_faces: int = MAX_SWAP_FACES
+    faces: list[DetectedFace]
+
+
+@router.post("/faceswap/scan", response_model=FaceScanResult)
+async def scan_faceswap_faces(image: UploadFile = File(...)) -> FaceScanResult:
+    """Find the faces in an uploaded photo so the caller can pick which to swap.
+
+    The photo is kept server-side under the returned `upload_id`; pass that id
+    to POST /tryon/faceswap instead of uploading the photo a second time.
+    """
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please upload a JPEG or PNG image.")
+
+    try:
+        image_bytes = await image.read()
+    finally:
+        await image.close()
+
+    try:
+        scan = await asyncio.to_thread(service.scan_faces, image_bytes, image.filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except (RuntimeError, FileNotFoundError) as exc:
+        logger.exception("Face scan failed: %s", exc)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+
+    upload_id = scan["upload_id"]
+    return FaceScanResult(
+        upload_id=upload_id,
+        image_width=scan["width"],
+        image_height=scan["height"],
+        faces=[
+            DetectedFace(
+                face_index=index,
+                bbox=face["bbox"],
+                det_score=face["det_score"],
+                thumbnail_url=f"/uploads/faceswap-image/{upload_id}/face_{index}.png",
+            )
+            for index, face in enumerate(scan["faces"])
+        ],
+    )
+
+
+@router.post("/faceswap", response_model=TryOnJobRead, status_code=status.HTTP_202_ACCEPTED)
+async def create_faceswap_job(
+    session: SessionDep,
+    background_tasks: BackgroundTasks,
+    upload_id: str = Form(...),
+    source_face_images: list[UploadFile] = File(...),
+    target_face_indices: list[int] = Form(...),
+    user_reference: str | None = Form(None),
+) -> TryOnJob:
+    """Replace the chosen faces in a previously scanned photo.
+
+    `target_face_indices` selects which faces from POST /tryon/faceswap/scan to
+    replace; `source_face_images` supplies the replacement face for each, in the
+    same order. Everything else in the photo is preserved.
+    """
+    scan = service.load_scan(upload_id)
+    if scan is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="That scan was not found. Re-upload the photo to scan it again.",
+        )
+
+    if len(source_face_images) != len(target_face_indices):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Each chosen face needs exactly one replacement photo.",
+        )
+    if not 1 <= len(target_face_indices) <= MAX_SWAP_FACES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Choose between 1 and {MAX_SWAP_FACES} faces to swap.",
+        )
+    if len(set(target_face_indices)) != len(target_face_indices):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The same face was chosen more than once.",
+        )
+    face_count = len(scan["faces"])
+    if any(index < 0 or index >= face_count for index in target_face_indices):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A chosen face isn't part of that scan.",
+        )
+    for image in source_face_images:
+        if not image.content_type or not image.content_type.startswith("image/"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please upload JPEG or PNG images.")
+
+    replacements: list[tuple[int, bytes, str | None]] = []
+    for target_index, image in zip(target_face_indices, source_face_images):
+        try:
+            replacements.append((target_index, await image.read(), image.filename))
+        finally:
+            await image.close()
+
+    job = await service.submit_face_swap_job(
+        session,
+        upload_id=upload_id,
+        scan=scan,
+        replacements=replacements,
+        user_reference=user_reference,
     )
     background_tasks.add_task(service.run_job, job.id)
     return TryOnJobRead.model_validate(job)

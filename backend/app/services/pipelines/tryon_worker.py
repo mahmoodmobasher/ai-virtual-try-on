@@ -53,11 +53,12 @@ def _worker_entry(request: dict, progress_queue: "mp.Queue", result_queue: "mp.Q
         pipeline = TryOnPipeline()
         output_path = pipeline.apply(
             Path(request["user_image_path"]),
-            Path(request["garment_image_path"]),
+            Path(request["garment_image_path"]) if request.get("garment_image_path") else None,
             Path(request["output_path"]),
             prompt=request.get("prompt"),
             mode=request.get("mode", "garment_swap"),
             category=request.get("category", "auto"),
+            face_swaps=request.get("face_swaps"),
             progress_cb=progress_cb,
         )
         result_queue.put(("done", str(output_path)))
@@ -79,11 +80,12 @@ def _worker_entry(request: dict, progress_queue: "mp.Queue", result_queue: "mp.Q
 def run_tryon_job(
     *,
     user_image_path: Path,
-    garment_image_path: Path,
+    garment_image_path: Optional[Path],
     output_path: Path,
     prompt: Optional[str] = None,
     mode: str = "garment_swap",
     category: str = "auto",
+    face_swaps: Optional[list[dict]] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
     timeout_seconds: Optional[float] = None,
 ) -> Path:
@@ -99,11 +101,12 @@ def run_tryon_job(
 
     request = {
         "user_image_path": str(user_image_path),
-        "garment_image_path": str(garment_image_path),
+        "garment_image_path": str(garment_image_path) if garment_image_path else None,
         "output_path": str(output_path),
         "prompt": prompt,
         "mode": mode,
         "category": category,
+        "face_swaps": face_swaps,
     }
 
     process = ctx.Process(

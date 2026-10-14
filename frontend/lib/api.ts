@@ -22,8 +22,8 @@ export type TryOnJob = {
   result_image_path?: string | null;
   failure_reason?: string | null;
   meta?: Record<string, unknown> | null;
-  // Diffusion step progress; null/undefined means no step-wise progress is
-  // available yet (e.g. before the first step, or a hosted engine).
+  // Faces swapped so far out of the total; null/undefined means no progress
+  // is available yet (e.g. before the first face is done).
   progress_current?: number | null;
   progress_total?: number | null;
 };
@@ -33,12 +33,33 @@ export async function fetchGarments(): Promise<Garment[]> {
   return data;
 }
 
-export async function createTryOn(form: FormData): Promise<TryOnJob> {
-  console.log("[API] Sending POST request to", `${API_BASE}/tryon/`);
-  const { data } = await axios.post<TryOnJob>(`${API_BASE}/tryon/`, form, {
+// The backend's own explanation (FastAPI's `detail`) when it sent one, rather
+// than axios's generic "Request failed with status code 400".
+export function apiErrorMessage(error: unknown, fallback: string): string {
+  if (axios.isAxiosError(error)) {
+    const detail = error.response?.data?.detail;
+    if (typeof detail === "string") return detail;
+  }
+  return error instanceof Error ? error.message : fallback;
+}
+
+export type ImageFaceScanResult = FaceScanResult & {
+  image_width: number;
+  image_height: number;
+  max_swap_faces: number;
+};
+
+export async function scanImageFaces(form: FormData): Promise<ImageFaceScanResult> {
+  const { data } = await axios.post<ImageFaceScanResult>(`${API_BASE}/tryon/faceswap/scan`, form, {
     headers: { "Content-Type": "multipart/form-data" }
   });
-  console.log("[API] Received response:", data);
+  return data;
+}
+
+export async function createImageFaceSwap(form: FormData): Promise<TryOnJob> {
+  const { data } = await axios.post<TryOnJob>(`${API_BASE}/tryon/faceswap`, form, {
+    headers: { "Content-Type": "multipart/form-data" }
+  });
   return data;
 }
 
@@ -65,8 +86,8 @@ export type DetectedFace = {
 };
 
 export type FaceScanResult = {
-  max_swap_faces: number;
   upload_id: string;
+  max_swap_faces: number;
   faces: DetectedFace[];
 };
 

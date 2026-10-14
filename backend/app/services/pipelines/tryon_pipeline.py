@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import cv2
 import numpy as np
@@ -94,12 +94,13 @@ class TryOnPipeline:
     def apply(
         self,
         user_image_path: Path,
-        garment_image_path: Path,
+        garment_image_path: Optional[Path],
         output_path: Path,
         *,
         prompt: str | None = None,
         mode: str = "garment_swap",
         category: str = "auto",
+        face_swaps: Optional[Sequence[dict]] = None,
         progress_cb: Optional[Callable[[int, int], None]] = None,
     ) -> Path:
         """
@@ -112,9 +113,13 @@ class TryOnPipeline:
             prompt: Optional text prompt for CatVTON-FLUX / FASHN Try-On Max.
             mode: "garment_swap", "face_swap" or "catvton_flux" (legacy "viton_hd" accepted).
             category: Garment category for clothes swap: auto, tops, bottoms or one-pieces.
-            progress_cb: Optional callback(step, total_steps) reporting diffusion progress.
-                Only honored by the local garment_swap engine; other engines/modes don't
-                have a comparable step-wise notion of progress.
+            face_swaps: face_swap only. Faces picked from a scan of `user_image_path`,
+                each a dict with the face's `kps` and the `source_image_path` of the
+                photo replacing it. When given, `user_image_path` is the photo being
+                re-faced and `garment_image_path` is unused.
+            progress_cb: Optional callback(step, total_steps) reporting diffusion steps
+                (local garment_swap engine) or faces swapped (face_swap); other
+                engines/modes don't have a comparable step-wise notion of progress.
         """
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -140,6 +145,8 @@ class TryOnPipeline:
             return self._apply_catvton_flux(user_image_path, garment_image_path, output_path, prompt)
 
         logger.info("Using Face Swap mode")
+        if face_swaps:
+            return self._apply_face_swaps(user_image_path, face_swaps, output_path, progress_cb)
         return self._apply_face_swap(user_image_path, garment_image_path, output_path)
 
     # ------------------------------------------------------------------
@@ -235,28 +242,15 @@ class TryOnPipeline:
         if garment_img_bgr is None:
             raise ValueError("The reference-outfit image could not be read. Please upload a valid JPEG or PNG image.")
 
-        user_faces = segmentation.face_app.get(user_img_bgr)
-        garment_faces = segmentation.face_app.get(garment_img_bgr)
-        has_user_face = len(user_faces) > 0
-        has_garment_face = len(garment_faces) > 0
-        logger.info("Face detection: source={}, reference={}", has_user_face, has_garment_face)
+        source_face = segmentation.get_primary_face(user_img_bgr)
+        target_face = segmentation.get_primary_face(garment_img_bgr)
+        logger.info("Face detection: source={}, reference={}", source_face is not None, target_face is not None)
 
-        if has_user_face and has_garment_face:
-            try:
-                swapped = segmentation.swap_face(
-                    source_image=user_img_bgr,
-                    target_image=garment_img_bgr,
-                )
-                cv2.imwrite(str(output_path), swapped)
-                logger.info("Face swap complete, saved to {}", output_path)
-                return output_path
-            except Exception as exc:  # pragma: no cover
-                logger.exception("Face swap failed: %s", exc)
-        else:
+        if source_face is None or target_face is None:
             missing = []
-            if not has_user_face:
+            if source_face is None:
                 missing.append("source image")
-            if not has_garment_face:
+            if target_face is None:
                 missing.append("reference outfit image")
             error_msg = (
                 f"No clear face was detected in the {' and '.join(missing)}. "
@@ -265,7 +259,46 @@ class TryOnPipeline:
             logger.warning(error_msg)
             raise ValueError(error_msg)
 
-        raise RuntimeError("Face swap failed to produce an output image.")
+        swapped = segmentation.swap_faces_image(garment_img_bgr, [(target_face.kps, source_face)])
+        cv2.imwrite(str(output_path), swapped)
+        logger.info("Face swap complete, saved to {}", output_path)
+        return output_path
+
+    def _apply_face_swaps(
+        self,
+        target_image_path: Path,
+        face_swaps: Sequence[dict],
+        output_path: Path,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+    ) -> Path:
+        """Replace the faces the user picked from a scan of the target photo."""
+        try:
+            segmentation = self.segmentation
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Face swap is unavailable because its ML runtime or model files are missing."
+            ) from exc
+
+        target_bgr = cv2.imread(str(target_image_path))
+        if target_bgr is None:
+            raise ValueError("The photo could not be read. Please upload a valid JPEG or PNG image.")
+
+        assignments = []
+        for position, swap in enumerate(face_swaps, start=1):
+            source_bgr = cv2.imread(str(swap["source_image_path"]))
+            if source_bgr is None:
+                raise ValueError(f"Could not read replacement photo #{position}.")
+            source_face = segmentation.get_primary_face(source_bgr)
+            if source_face is None:
+                raise ValueError(
+                    f"No face found in replacement photo #{position}. Use a clear, front-facing photo."
+                )
+            assignments.append((np.asarray(swap["kps"], dtype=np.float32), source_face))
+
+        swapped = segmentation.swap_faces_image(target_bgr, assignments, progress_cb=progress_cb)
+        cv2.imwrite(str(output_path), swapped)
+        logger.info("Face swap complete ({} face(s)), saved to {}", len(assignments), output_path)
+        return output_path
 
     # ------------------------------------------------------------------
     # CatVTON mode

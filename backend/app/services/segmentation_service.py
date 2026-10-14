@@ -59,6 +59,13 @@ def _resolve_execution_providers() -> list[str]:
 IDENTITY_MATCH_THRESHOLD = 0.25
 
 
+# inswapper works on a 128px face crop, so a face that is larger than that in
+# the photo comes back soft. For stills the crop is taken at up to this many
+# times that size and swapped as interleaved 128px tiles ("pixel boost"), which
+# recovers real detail up to 512px without needing another model.
+MAX_PIXEL_BOOST = 4
+
+
 @dataclass
 class FaceSwapSlot:
     """One "replace this person with this face" assignment, tracked across frames.
@@ -185,14 +192,9 @@ class SegmentationService:
                 best, best_score = face, score
         return best
 
-    def _swap_forward(self, frame: np.ndarray, target_face: Any, source_face: Any) -> tuple[np.ndarray, np.ndarray]:
-        """Run the inswapper network for one face; returns the 128px result and its transform.
-
-        This is the expensive half of a swap (~65% of per-face cost) and touches
-        no shared state, so several faces can run through it concurrently.
-        """
+    def _swap_aligned(self, aimg: np.ndarray, latent: np.ndarray) -> np.ndarray:
+        """Run the inswapper network on one aligned, model-sized BGR face crop."""
         swapper = self.face_swapper
-        aimg, matrix = face_align.norm_crop2(frame, target_face.kps, swapper.input_size[0])
         blob = cv2.dnn.blobFromImage(
             aimg,
             1.0 / swapper.input_std,
@@ -200,16 +202,79 @@ class SegmentationService:
             (swapper.input_mean, swapper.input_mean, swapper.input_mean),
             swapRB=True,
         )
-        latent = source_face.normed_embedding.reshape((1, -1))
-        latent = np.dot(latent, swapper.emap)
-        latent /= np.linalg.norm(latent)
-
         pred = swapper.session.run(
             swapper.output_names,
             {swapper.input_names[0]: blob, swapper.input_names[1]: latent},
         )[0]
-        bgr_fake = np.clip(255 * pred.transpose((0, 2, 3, 1))[0], 0, 255).astype(np.uint8)[:, :, ::-1]
+        return np.clip(255 * pred.transpose((0, 2, 3, 1))[0], 0, 255).astype(np.uint8)[:, :, ::-1]
+
+    def _swap_forward(
+        self, frame: np.ndarray, target_kps: np.ndarray, source_face: Any, boost: int = 1
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Run the inswapper network for one face; returns the swapped crop and its transform.
+
+        This is the expensive half of a swap (~65% of per-face cost) and touches
+        no shared state, so several faces can run through it concurrently.
+
+        With `boost` > 1 the face is aligned at `boost` times the model's 128px
+        input and split into boost² interleaved 128px tiles (every boost-th
+        pixel, one tile per sub-pixel offset). Each tile is a complete face the
+        network can swap, and re-interleaving the results gives a crop with
+        `boost` times the resolution at boost² times the inference cost.
+        """
+        swapper = self.face_swapper
+        aimg, matrix = face_align.norm_crop2(frame, target_kps, swapper.input_size[0] * boost)
+        latent = source_face.normed_embedding.reshape((1, -1))
+        latent = np.dot(latent, swapper.emap)
+        latent /= np.linalg.norm(latent)
+
+        if boost == 1:
+            return self._swap_aligned(aimg, latent), matrix
+
+        bgr_fake = np.empty_like(aimg)
+        for dy in range(boost):
+            for dx in range(boost):
+                tile = np.ascontiguousarray(aimg[dy::boost, dx::boost])
+                bgr_fake[dy::boost, dx::boost] = self._swap_aligned(tile, latent)
         return bgr_fake, matrix
+
+    def _pixel_boost_for(self, target_kps: np.ndarray) -> int:
+        """Smallest boost whose crop covers the face at its native resolution."""
+        model_size = self.face_swapper.input_size[0]
+        matrix = face_align.estimate_norm(np.asarray(target_kps, dtype=np.float32), model_size)
+        # The transform's scale is model pixels per image pixel, so this is how
+        # many image pixels the model's crop spans.
+        face_span = model_size / float(np.hypot(matrix[0, 0], matrix[1, 0]))
+        # Small tolerance so a face barely over a multiple doesn't pay for the next one.
+        return int(np.clip(np.ceil(face_span / model_size - 0.15), 1, MAX_PIXEL_BOOST))
+
+    def swap_faces_image(
+        self,
+        image: np.ndarray,
+        assignments: Sequence[tuple[np.ndarray, Any]],
+        progress_cb: Optional[Any] = None,
+    ) -> np.ndarray:
+        """Swap chosen faces in a still image at the best quality inswapper allows.
+
+        `assignments` pairs the 5-point landmarks of a face in `image` with the
+        detected face replacing it. Unlike the per-frame video path this spends
+        extra inference on pixel boost, sized to each face.
+        """
+        swapped = []
+        for done, (target_kps, source_face) in enumerate(assignments, start=1):
+            target_kps = np.asarray(target_kps, dtype=np.float32)
+            boost = self._pixel_boost_for(target_kps)
+            logger.info("Swapping face {}/{} at {}x pixel boost", done, len(assignments), boost)
+            # Every crop is taken from the untouched image, then composited in
+            # order, so overlapping faces blend deterministically.
+            swapped.append(self._swap_forward(image, target_kps, source_face, boost=boost))
+            if progress_cb:
+                progress_cb(done, len(assignments))
+
+        result = image
+        for bgr_fake, matrix in swapped:
+            result = self._paste_swapped(result, bgr_fake, matrix)
+        return result
 
     @staticmethod
     def _paste_swapped(frame: np.ndarray, bgr_fake: np.ndarray, matrix: np.ndarray) -> np.ndarray:
@@ -283,7 +348,7 @@ class SegmentationService:
         # single-threaded on purpose: callers processing a video run whole
         # frames concurrently, and adding a second layer of threads here only
         # contends for the same accelerator.
-        swapped = [self._swap_forward(frame, match, slot.source_face) for slot, match in matches]
+        swapped = [self._swap_forward(frame, match.kps, slot.source_face) for slot, match in matches]
 
         result = frame
         for bgr_fake, matrix in swapped:
@@ -382,42 +447,6 @@ class SegmentationService:
             segmented_path = output_dir / f"{image_path.stem}_nobg.png"
             self.remove_background(image_path, segmented_path)
             result["segmented_path"] = str(segmented_path)
-        
-        return result
-
-    def swap_face(
-        self,
-        source_image: np.ndarray,
-        target_image: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Swap face from source image onto target image.
-        
-        Args:
-            source_image: BGR numpy array containing the face to extract
-            target_image: BGR numpy array to receive the swapped face
-            
-        Returns:
-            Result BGR image with swapped face
-        """
-        # Detect faces in both images
-        source_faces = self.face_app.get(source_image)
-        target_faces = self.face_app.get(target_image)
-        
-        if not source_faces:
-            logger.warning("No face detected in source image")
-            return target_image
-        
-        if not target_faces:
-            logger.warning("No face detected in target image")
-            return target_image
-        
-        # Use the largest face from each image
-        source_face = max(source_faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-        target_face = max(target_faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-        
-        # Perform face swap
-        result = self.face_swapper.get(target_image, target_face, source_face, paste_back=True)
         
         return result
 

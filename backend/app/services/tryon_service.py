@@ -1,18 +1,31 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
+import shutil
 import uuid
 from pathlib import Path
 from typing import Optional
 
+import cv2
 from loguru import logger
-from PIL import Image
+from PIL import Image, ImageOps
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from ..core.config import get_settings
 from ..core.database import db
 from ..models import Garment, TryOnJob, TryOnStatus
 from .pipelines.tryon_worker import run_tryon_job
+
+
+# Most faces one face-swap job may replace.
+MAX_SWAP_FACES = 4
+# Upper bound on faces offered in the picker, most prominent first.
+MAX_SCANNED_FACES = 12
+
+_UPLOAD_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
+_SCAN_FILE = "scan.json"
 
 
 class TryOnService:
@@ -82,6 +95,101 @@ class TryOnService:
 
         return job
 
+    # ------------------------------------------------------------------
+    # Face swap: scan the photo for faces, then swap the ones the user picked
+    # ------------------------------------------------------------------
+    def _scan_dir(self, upload_id: str) -> Path:
+        return self.settings.uploads_dir / "faceswap-image" / upload_id
+
+    def scan_faces(self, image_bytes: bytes, filename: str | None) -> dict:
+        """Find the faces in a photo so the caller can pick which to swap.
+
+        The photo and each face's landmarks are kept on disk under the returned
+        `upload_id`, so the swap job reuses exactly what the user was shown
+        rather than re-uploading and re-detecting. Blocking (runs detection);
+        call via a worker thread.
+        """
+        # Imported here so the API can start without the optional ML stack.
+        from .segmentation_service import get_segmentation_service
+
+        upload_id = uuid.uuid4().hex
+        scan_dir = self._scan_dir(upload_id)
+        try:
+            image_path = self._persist_upload(image_bytes, filename, scan_dir)
+            image = cv2.imread(str(image_path))
+            if image is None:
+                raise ValueError("That photo could not be read. Please upload a valid JPEG or PNG image.")
+
+            segmentation = get_segmentation_service()
+            faces = segmentation.detect_faces(image)
+            # Keep the most prominent faces, then list them left to right so the
+            # numbering matches how the photo reads.
+            faces.sort(key=lambda f: (f["bbox"][2] - f["bbox"][0]) * (f["bbox"][3] - f["bbox"][1]), reverse=True)
+            del faces[MAX_SCANNED_FACES:]
+            faces.sort(key=lambda f: f["bbox"][0])
+
+            for index, face in enumerate(faces):
+                cv2.imwrite(str(scan_dir / f"face_{index}.png"), segmentation.crop_face(image, face["bbox"]))
+        except Exception:
+            shutil.rmtree(scan_dir, ignore_errors=True)
+            raise
+
+        if not faces:
+            shutil.rmtree(scan_dir, ignore_errors=True)
+
+        height, width = image.shape[:2]
+        scan = {"image": image_path.name, "width": width, "height": height, "faces": faces}
+        if faces:
+            (scan_dir / _SCAN_FILE).write_text(json.dumps(scan))
+        logger.info("Face scan {}: {} face(s) found", upload_id, len(faces))
+        return {"upload_id": upload_id, **scan}
+
+    def load_scan(self, upload_id: str) -> dict | None:
+        """The stored result of `scan_faces`, or None if there is no such scan."""
+        if not _UPLOAD_ID_PATTERN.fullmatch(upload_id):
+            return None
+        scan_file = self._scan_dir(upload_id) / _SCAN_FILE
+        if not scan_file.exists():
+            return None
+        return json.loads(scan_file.read_text())
+
+    async def submit_face_swap_job(
+        self,
+        session: AsyncSession,
+        *,
+        upload_id: str,
+        scan: dict,
+        replacements: list[tuple[int, bytes, str | None]],
+        user_reference: Optional[str] = None,
+    ) -> TryOnJob:
+        """Persist a pending face-swap job for a scanned photo.
+
+        `replacements` pairs a face index from the scan with the bytes and
+        filename of the photo replacing that face.
+        """
+        scan_dir = self._scan_dir(upload_id)
+        face_swaps = []
+        for face_index, image_bytes, filename in replacements:
+            source_path = self._persist_upload(image_bytes, filename, scan_dir / "replacements")
+            face_swaps.append(
+                {
+                    "face_index": face_index,
+                    "kps": scan["faces"][face_index]["kps"],
+                    "source_image_path": str(source_path),
+                }
+            )
+
+        job = TryOnJob(
+            input_image_path=str(scan_dir / scan["image"]),
+            status=TryOnStatus.pending,
+            user_reference=user_reference,
+            meta={"mode": "face_swap", "upload_id": upload_id, "face_swaps": face_swaps},
+        )
+        session.add(job)
+        await session.commit()
+        await session.refresh(job)
+        return job
+
     async def run_job(self, job_id: int) -> None:
         """Process a previously-created pending job. Opens its own DB session so it
         can run as a background task after the request that created the job returns."""
@@ -108,7 +216,8 @@ class TryOnService:
                 if garment:
                     resolved_garment_path = self._resolve_garment_image(garment)
 
-            if resolved_garment_path is None:
+            face_swaps = meta.get("face_swaps")
+            if resolved_garment_path is None and not face_swaps:
                 raise FileNotFoundError("Garment image not available for try-on job.")
 
             output_path = Path(self.settings.results_dir) / f"{job.id}_result.png"
@@ -124,6 +233,7 @@ class TryOnService:
                 prompt=meta.get("prompt"),
                 mode=meta.get("mode", "garment_swap"),
                 category=meta.get("category", "auto"),
+                face_swaps=face_swaps,
                 progress_cb=on_progress,
             )
             job.result_image_path = f"/results/{output_path.name}"
@@ -145,11 +255,15 @@ class TryOnService:
         file_path = target_dir / f"{uuid.uuid4().hex}{suffix}"
         with file_path.open("wb") as buffer:
             buffer.write(image_bytes)
-        # Normalize orientation
+        # Bake in EXIF orientation and normalize to RGB. Only re-encode when that
+        # actually changes the pixels, and then at high quality: re-saving a JPEG
+        # at the default quality softens the photo before any model sees it.
         try:
-            image = Image.open(file_path)
-            image = image.convert("RGB")
-            image.save(file_path)
+            with Image.open(file_path) as image:
+                rotated = image.getexif().get(0x0112, 1) != 1
+                if rotated or image.mode != "RGB":
+                    normalized = ImageOps.exif_transpose(image).convert("RGB")
+                    normalized.save(file_path, quality=95, subsampling=0)
         except Exception as exc:
             logger.warning("Failed to normalize upload image: %s", exc)
         return file_path
